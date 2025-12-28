@@ -318,10 +318,18 @@ def crossover_rot(parent1, parent2, prob):
     child[mask] = parent2[mask]
     return child
 
-def evaluate_fitness(model, x, y, pop_r, pop_c, pop_k, block_size, enable_rotation=False):
-    """Evaluate fitness of the population (CrossEntropyLoss) per sample."""
+def evaluate_fitness(models_list, x, y, pop_r, pop_c, pop_k, block_size, enable_rotation=False):
+    """
+    Evaluate fitness of the population (Ensemble CrossEntropyLoss) per sample.
+    Implements multi-model ensemble feedback with variance penalty.
+    Phi = Sum(CE) - Sum((CE - Mean(CE))^2)
+    """
     fitness_scores = []
     device = x.device
+    
+    # Ensure models_list is a list to support single model or ensemble
+    if not isinstance(models_list, list):
+        models_list = [models_list]
     
     # We evaluate each individual in the population
     for i in range(len(pop_r)):
@@ -341,19 +349,40 @@ def evaluate_fitness(model, x, y, pop_r, pop_c, pop_k, block_size, enable_rotati
             # Apply block permutation with FIXED k_map for this individual
             x_perm = apply_block_transformation(x, idx_r, idx_c, block_size, k_map, enable_rotation)
             
-            output = get_model_output(model, x_perm)
-            if output.dim() == 1:
-                output = output.unsqueeze(0)
-            elif output.dim() > 2:
-                output = output.view(output.size(0), -1)
+            # Calculate losses for all models
+            losses_list = []
+            for model in models_list:
+                output = get_model_output(model, x_perm)
+                if output.dim() == 1:
+                    output = output.unsqueeze(0)
+                elif output.dim() > 2:
+                    output = output.view(output.size(0), -1)
+                
+                # Use reduction='none' to get loss per sample
+                loss = F.cross_entropy(output, y, reduction='none')
+                losses_list.append(loss)
             
-            # Use reduction='none' to get loss per sample
-            loss = F.cross_entropy(output, y, reduction='none')
-            fitness_scores.append(loss.cpu().numpy())
+            # Stack losses: (num_models, B)
+            losses = torch.stack(losses_list, dim=0)
+            
+            # Calculate fitness according to formula: Phi = Sum(CE) - Sum((CE - Mean(CE))^2)
+            # This encourages high loss across all models (Transferability) and penalizes variance
+            
+            sum_loss = torch.sum(losses, dim=0)
+            mean_loss = torch.mean(losses, dim=0)
+            
+            # Variance term
+            diff = losses - mean_loss.unsqueeze(0)
+            variance_term = torch.sum(diff ** 2, dim=0)
+            
+            # Final score
+            score = sum_loss - variance_term
+            
+            fitness_scores.append(score.cpu().numpy())
             
     return np.array(fitness_scores) # (pop_size, B)
 
-def ldr_attack(x, y, model, eps=16/255, iterations=10, mu=1.0, 
+def ldr_attack(x, y, source_models, eps=16/255, iterations=10, mu=1.0, 
                de_pop_size=5, de_generations=5, de_prob_m=0.5, de_prob_c=0.8,
                block_size=1, enable_rotation=False):
 
@@ -362,6 +391,10 @@ def ldr_attack(x, y, model, eps=16/255, iterations=10, mu=1.0,
     """
     device = x.device
     B, C, H, W = x.shape
+    
+    # Ensure source_models is a list
+    if not isinstance(source_models, list):
+        source_models = [source_models]
     
     # Ensure x is detached for DE phase to avoid memory leaks
     x_de = x.detach()
@@ -379,7 +412,7 @@ def ldr_attack(x, y, model, eps=16/255, iterations=10, mu=1.0,
     pop_k = init_rotation_population_batch(de_pop_size, n_h, n_w, B, device=device) if enable_rotation else [None]*de_pop_size
     
     # Initial fitness: (pop_size, B)
-    fitness = evaluate_fitness(model, x_de, y, pop_r, pop_c, pop_k, block_size, enable_rotation)
+    fitness = evaluate_fitness(source_models, x_de, y, pop_r, pop_c, pop_k, block_size, enable_rotation)
     
     # Track best per sample
     best_indices = np.argmax(fitness, axis=0) # (B,)
@@ -432,7 +465,7 @@ def ldr_attack(x, y, model, eps=16/255, iterations=10, mu=1.0,
             new_pop_k.append(u_k)
             
         # Evaluate candidates
-        new_fitness = evaluate_fitness(model, x_de, y, new_pop_r, new_pop_c, new_pop_k, block_size, enable_rotation)
+        new_fitness = evaluate_fitness(source_models, x_de, y, new_pop_r, new_pop_c, new_pop_k, block_size, enable_rotation)
         
         # Selection (Greedy per sample)
         for i in range(de_pop_size):
@@ -527,16 +560,20 @@ def ldr_attack(x, y, model, eps=16/255, iterations=10, mu=1.0,
         # x_trans will be (B*N, C, H, W)
         x_trans = apply_block_transformation(x_inputs, idx_r_all, idx_c_all, block_size, k_map_all, enable_rotation)
 
-        output = get_model_output(model, x_trans)
-        if output.dim() == 1:
-            output = output.unsqueeze(0)
-        elif output.dim() > 2:
-            output = output.view(output.size(0), -1)
-
         # Targets need to be repeated to match batch size
         y_repeated = y.repeat(num_augmentations)
+        
+        total_loss = 0.0
+        for model in source_models:
+            output = get_model_output(model, x_trans)
+            if output.dim() == 1:
+                output = output.unsqueeze(0)
+            elif output.dim() > 2:
+                output = output.view(output.size(0), -1)
 
-        loss = F.cross_entropy(output, y_repeated)
+            total_loss += F.cross_entropy(output, y_repeated)
+        
+        loss = total_loss / len(source_models)
 
         # Compute gradient
         # autograd will aggregate gradients from all copies back to x_adv
@@ -582,6 +619,24 @@ def main_cli():
     except ValueError as e:
         print(f"Error loading model: {e}")
         return
+
+    # Prepare Ensemble
+    ensemble_models = [source_model]
+    # Load auxiliary models for ensemble feedback
+    aux_models = ['tv_resnet50', 'tv_vgg16']
+    print(f"Loading auxiliary models for ensemble: {aux_models}")
+    for aux_name in aux_models:
+        # Avoid duplicating the main source model if it's one of the aux models
+        if aux_name == args.model:
+             continue
+             
+        try:
+            aux_model = load_source_model(aux_name, device, model_repo)
+            ensemble_models.append(aux_model)
+        except Exception as e:
+            print(f"Warning: Could not load auxiliary model {aux_name}: {e}")
+            
+    print(f"Ensemble size: {len(ensemble_models)}")
 
     all_models = model_repo.get_all_model_names()
     target_models = model_repo.get_target_models(all_models)
@@ -637,7 +692,7 @@ def main_cli():
         source_orig_preds = get_model_prediction(source_model, x_batch)
         print(f"True Label: {y_batch[0].item()}, Model Pred: {source_orig_preds[0]}")
         # Run LDR Attack
-        x_adv_batch = ldr_attack(x_batch, y_batch, source_model, **attack_params)
+        x_adv_batch = ldr_attack(x_batch, y_batch, ensemble_models, **attack_params)
         
         # Save adversarial images
         for i in range(len(filename_batch)):
