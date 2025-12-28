@@ -9,6 +9,7 @@ from torchvision import transforms
 from PIL import Image
 from tqdm import tqdm
 from models import ModelRepository, Normalize
+
 class AttackDataset(Dataset):
     def __init__(self, label_df, img_root, transform):
         self.label_df = label_df
@@ -50,6 +51,7 @@ def load_source_model(model_name, device, model_repo):
     加载源模型。如果是 'tv_' 开头，加载 torchvision 官方模型；
     否则从 ModelRepository 加载。
     """
+    import torch.nn as nn  # 在函数内部显式导入，确保作用域内可用
     if model_name.startswith('tv_'):
         import torchvision.models as tv_models
         name = model_name.replace('tv_', '')
