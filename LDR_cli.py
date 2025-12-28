@@ -483,42 +483,48 @@ def ldr_attack(x, y, model, eps=16/255, iterations=10, mu=1.0,
     # 循环结束后，可以加一个最终统计
     print(f"  >> DE Optimization Finished. Final Avg Best Loss: {best_fitness.mean():.4f}")            
 
-    # # --- Step 2: MI-FGSM with Learned Permutation & Rotation ---
+    # --- Step 2: MI-FGSM with Learned Permutation & Rotation ---
     # x_adv = x.clone().detach()
     # alpha = eps / max(iterations, 1)
     # momentum = torch.zeros_like(x_adv, device=device)
     #
-    # # Convert best perms to torch indices
-    # idx_r = torch.from_numpy(best_r).long().to(device)
-    # idx_c = torch.from_numpy(best_c).long().to(device)
-    #
+    # --- Step 2: 暂时跳过 MI-FGSM，直接测试 DE 的乱序结果 ---
+    # Convert best perms to torch indices
+    idx_r = torch.from_numpy(best_r).long().to(device)
+    idx_c = torch.from_numpy(best_c).long().to(device)
+    k_map = torch.from_numpy(best_k).long().to(device) if enable_rotation else None
+
+    # 直接返回经过乱序处理的原始像素图像
+    x_adv = apply_block_transformation(x, idx_r, idx_c, block_size, k_map, enable_rotation)
+    return x_adv.detach()
+
     # if enable_rotation and best_k is not None:
     #     k_map = torch.from_numpy(best_k).long().to(device)
     # else:
     #     k_map = None
-    
-    for _ in range(iterations):
-        x_adv.requires_grad_(True)
-        
-        # Apply transformation: Tau(x) = R * x * C
-        # idx_r, idx_c are (B, n_h) and (B, n_w)
-        x_trans = apply_block_transformation(x_adv, idx_r, idx_c, block_size, k_map, enable_rotation)
-        
-        output = get_model_output(model, x_trans)
-        if output.dim() == 1:
-            output = output.unsqueeze(0)
-        elif output.dim() > 2:
-            output = output.view(output.size(0), -1)
-            
-        loss = F.cross_entropy(output, y)
-        
-        grad = torch.autograd.grad(loss, [x_adv])[0]
-        grad = grad / (torch.mean(torch.abs(grad), dim=(1, 2, 3), keepdim=True) + 1e-8)
-        
-        momentum = mu * momentum + grad
-        x_adv = x_adv.detach() + alpha * torch.sign(momentum)
-        delta = torch.clamp(x_adv - x, min=-eps, max=eps)
-        x_adv = torch.clamp(x + delta, 0, 1)
+    #
+    # for _ in range(iterations):
+    #     x_adv.requires_grad_(True)
+    #
+    #     # Apply transformation: Tau(x) = R * x * C
+    #     # idx_r, idx_c are (B, n_h) and (B, n_w)
+    #     x_trans = apply_block_transformation(x_adv, idx_r, idx_c, block_size, k_map, enable_rotation)
+    #
+    #     output = get_model_output(model, x_trans)
+    #     if output.dim() == 1:
+    #         output = output.unsqueeze(0)
+    #     elif output.dim() > 2:
+    #         output = output.view(output.size(0), -1)
+    #
+    #     loss = F.cross_entropy(output, y)
+    #
+    #     grad = torch.autograd.grad(loss, [x_adv])[0]
+    #     grad = grad / (torch.mean(torch.abs(grad), dim=(1, 2, 3), keepdim=True) + 1e-8)
+    #
+    #     momentum = mu * momentum + grad
+    #     x_adv = x_adv.detach() + alpha * torch.sign(momentum)
+    #     delta = torch.clamp(x_adv - x, min=-eps, max=eps)
+    #     x_adv = torch.clamp(x + delta, 0, 1)
         
     return x_adv.detach()
 
