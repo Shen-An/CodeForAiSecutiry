@@ -91,15 +91,11 @@ def load_source_model(model_name, device, model_repo):
 
 def apply_block_transformation(x, idx_r, idx_c, block_size, k_map=None, enable_rotation=False):
     """
-    Apply block-level permutation and optional rotation.
-    x: (B, C, H, W)
-    idx_r: (B, Nh) or (Nh,) tensor of row block indices
-    idx_c: (B, Nw) or (Nw,) tensor of col block indices
-    block_size: int
-    k_map: (B, Nh, Nw) tensor of rotation types (0-3), optional.
-    enable_rotation: bool
+    Apply block-level permutation and optional rotation using PyTorch native operators.
+    Ensures differentiability for autograd.
     """
     B, C, H, W = x.shape
+    device = x.device
     
     # 1. Pad to multiple of block_size
     h_pad = (block_size - H % block_size) % block_size
@@ -118,81 +114,72 @@ def apply_block_transformation(x, idx_r, idx_c, block_size, k_map=None, enable_r
     x_blocks = x_padded.view(B, C, n_h, block_size, n_w, block_size)
     
     # 3. Permute blocks
-    # Handle idx_r and idx_c broadcasting
+    
+    # Prepare indices for broadcasting
+    batch_idx = torch.arange(B, device=device).view(B, 1, 1)
+    channel_idx = torch.arange(C, device=device).view(1, C, 1)
+    
+    # Row permutation (dim 2)
     if idx_r.dim() == 1:
-        idx_r = idx_r.unsqueeze(0).expand(B, -1)
-    if idx_c.dim() == 1:
-        idx_c = idx_c.unsqueeze(0).expand(B, -1)
+        row_idx = idx_r.view(1, 1, -1).expand(B, C, -1)
+    else:
+        row_idx = idx_r.view(B, 1, n_h).expand(B, C, -1)
         
-    # Use Advanced Indexing for efficient permutation
-    
-    # 1. Row permutation (dim 2)
     # x_blocks: (B, C, n_h, block_size, n_w, block_size)
-    # We want to permute dim 2 based on idx_r (B, n_h)
+    # Indexing first 3 dims
+    x_row_perm = x_blocks[batch_idx, channel_idx, row_idx]
     
-    ib = torch.arange(B, device=x.device).view(B, 1, 1)
-    ic = torch.arange(C, device=x.device).view(1, C, 1)
-    ir = idx_r.view(B, 1, n_h)
+    # Col permutation (dim 4)
+    # Permute dim 4 to dim 2 to reuse indexing logic
+    # (B, C, n_h, block_size, n_w, block_size) -> (B, C, n_w, n_h, block_size, block_size)
+    x_temp = x_row_perm.permute(0, 1, 4, 2, 3, 5)
     
-    # Result shape: (B, C, n_h, block_size, n_w, block_size)
-    x_perm = x_blocks[ib, ic, ir]
+    if idx_c.dim() == 1:
+        col_idx = idx_c.view(1, 1, -1).expand(B, C, -1)
+    else:
+        col_idx = idx_c.view(B, 1, n_w).expand(B, C, -1)
+        
+    x_col_perm = x_temp[batch_idx, channel_idx, col_idx]
     
-    # 2. Col permutation (dim 4)
-    # We want to permute dim 4 based on idx_c (B, n_w)
-    # To avoid complex 6D indexing, we permute dim 4 to dim 1, index, then permute back.
-    
-    # (B, C, n_h, block_size, n_w, block_size) -> (B, n_w, C, n_h, block_size, block_size)
-    x_perm = x_perm.permute(0, 4, 1, 2, 3, 5)
-    
-    ib = torch.arange(B, device=x.device).view(B, 1)
-    ic_col = idx_c.view(B, n_w)
-    
-    # Indexing dim 1 (n_w) with (B, n_w)
-    # Result: (B, n_w, C, n_h, block_size, block_size)
-    x_perm = x_perm[ib, ic_col]
-    
-    # Permute back: (B, n_w, C, n_h, block_size, block_size) -> (B, C, n_h, block_size, n_w, block_size)
-    # Dims: 0, 2, 3, 4, 1, 5
-    x_perm = x_perm.permute(0, 2, 3, 4, 1, 5)
+    # Permute back: (B, C, n_w, n_h, block_size, block_size) -> (B, C, n_h, block_size, n_w, block_size)
+    # Target dims: 0, 1, 3, 4, 2, 5
+    x_perm = x_col_perm.permute(0, 1, 3, 4, 2, 5)
     
     # 4. Optional Rotation
     if enable_rotation:
-        # Permute to (B, C, n_h, n_w, block_size, block_size) to handle rotation
-        x_reshaped = x_perm.permute(0, 1, 2, 4, 3, 5)
+        # (B, C, n_h, block_size, n_w, block_size) -> (B, C, n_h, n_w, block_size, block_size)
+        x_rot_in = x_perm.permute(0, 1, 2, 4, 3, 5)
         
-        # Create output tensor
-        x_rotated = torch.zeros_like(x_reshaped)
-        
-        # Use provided k_map or generate random one
         if k_map is None:
-            # If k_map is not provided, we generate one. 
-            # Note: For MI-FGSM stability, k_map should be provided (fixed).
-            k_map = torch.randint(0, 4, (B, n_h, n_w), device=x.device)
-        else:
-            # Ensure k_map matches batch size if it was generated for a single individual
-            if k_map.shape[0] != B:
-                k_map = k_map.expand(B, -1, -1)
+            k_map = torch.randint(0, 4, (B, n_h, n_w), device=device)
+        elif k_map.shape[0] != B:
+            k_map = k_map.expand(B, -1, -1)
+            
+        # Compute all 4 rotations
+        # x_rot_in: (B, C, n_h, n_w, H_b, W_b)
+        # rot90 rotates dims 4 and 5
+        r0 = x_rot_in
+        r1 = torch.rot90(x_rot_in, 1, [4, 5])
+        r2 = torch.rot90(x_rot_in, 2, [4, 5])
+        r3 = torch.rot90(x_rot_in, 3, [4, 5])
         
-        for k in range(4):
-            mask = (k_map == k)
-            if not mask.any():
-                continue
-            
-            # Expand mask: (B, C, n_h, n_w, block_size, block_size)
-            mask_exp = mask.unsqueeze(1).unsqueeze(4).unsqueeze(5).expand_as(x_reshaped)
-            
-            # Rotate dims 4 and 5 (block_size, block_size)
-            rotated_k = torch.rot90(x_reshaped, k, [4, 5])
-            
-            x_rotated[mask_exp] = rotated_k[mask_exp]
-            
+        # Stack: (B, C, n_h, n_w, H_b, W_b, 4)
+        r_stack = torch.stack([r0, r1, r2, r3], dim=-1)
+        
+        # Expand k_map for gathering
+        # k_map: (B, n_h, n_w) -> (B, C, n_h, n_w, H_b, W_b, 1)
+        k_map_expanded = k_map.view(B, 1, n_h, n_w, 1, 1, 1).expand(B, C, n_h, n_w, block_size, block_size, 1)
+        
+        # Gather along last dim
+        x_rotated = torch.gather(r_stack, 6, k_map_expanded).squeeze(6)
+        
         # Permute back to (B, C, n_h, block_size, n_w, block_size)
         x_out_blocks = x_rotated.permute(0, 1, 2, 4, 3, 5)
     else:
         x_out_blocks = x_perm
 
     # 5. Reshape back to image
-    x_out = x_out_blocks.contiguous().view(B, C, H_p, W_p)
+    x_out = x_out_blocks.reshape(B, C, H_p, W_p)
     
     # 6. Crop padding if necessary
     if h_pad > 0 or w_pad > 0:
@@ -490,21 +477,55 @@ def ldr_attack(x, y, model, eps=16/255, iterations=10, mu=1.0,
     momentum = torch.zeros_like(x_adv, device=device)
 
     # Convert best perms to torch indices
-    idx_r = torch.from_numpy(best_r).long().to(device)
-    idx_c = torch.from_numpy(best_c).long().to(device)
+    idx_r_best = torch.from_numpy(best_r).long().to(device)
+    idx_c_best = torch.from_numpy(best_c).long().to(device)
     
     if enable_rotation and best_k is not None:
-        k_map = torch.from_numpy(best_k).long().to(device)
+        k_map_best = torch.from_numpy(best_k).long().to(device)
     else:
-        k_map = None
+        k_map_best = None
+
+    # Number of augmentations for gradient averaging (BSR style)
+    num_augmentations = 20
 
     for _ in range(iterations):
         x_adv.requires_grad_(True)
 
+        # Create batch of N augmented images
+        # 1. Repeat x_adv: (B, C, H, W) -> (B*N, C, H, W)
+        # This creates N copies of the batch stacked along dim 0
+        x_inputs = x_adv.repeat(num_augmentations, 1, 1, 1)
+        
+        # 2. Prepare indices for the augmented batch
+        # We want the first copy (B images) to use the DE-optimized indices
+        # The remaining N-1 copies ((N-1)*B images) to use random indices
+        
+        num_rand = (num_augmentations - 1) * B
+        
+        # Generate random indices for the rest
+        rand_r = torch.rand(num_rand, n_h, device=device)
+        idx_r_rand = torch.argsort(rand_r, dim=-1)
+        
+        rand_c = torch.rand(num_rand, n_w, device=device)
+        idx_c_rand = torch.argsort(rand_c, dim=-1)
+        
+        # Concatenate best indices with random indices
+        idx_r_all = torch.cat([idx_r_best, idx_r_rand], dim=0)
+        idx_c_all = torch.cat([idx_c_best, idx_c_rand], dim=0)
+        
+        if enable_rotation:
+            if k_map_best is not None:
+                k_map_rand = torch.randint(0, 4, (num_rand, n_h, n_w), device=device)
+                k_map_all = torch.cat([k_map_best, k_map_rand], dim=0)
+            else:
+                # Fallback if k_map_best is None but rotation enabled
+                k_map_all = torch.randint(0, 4, (B * num_augmentations, n_h, n_w), device=device)
+        else:
+            k_map_all = None
+
         # Apply transformation: Tau(x) = R * x * C
-        # idx_r, idx_c are (B, n_h) and (B, n_w)
-        # 这里的 x_trans 就是“DE处理后的图片”
-        x_trans = apply_block_transformation(x_adv, idx_r, idx_c, block_size, k_map, enable_rotation)
+        # x_trans will be (B*N, C, H, W)
+        x_trans = apply_block_transformation(x_inputs, idx_r_all, idx_c_all, block_size, k_map_all, enable_rotation)
 
         output = get_model_output(model, x_trans)
         if output.dim() == 1:
@@ -512,11 +533,13 @@ def ldr_attack(x, y, model, eps=16/255, iterations=10, mu=1.0,
         elif output.dim() > 2:
             output = output.view(output.size(0), -1)
 
-        loss = F.cross_entropy(output, y)
+        # Targets need to be repeated to match batch size
+        y_repeated = y.repeat(num_augmentations)
 
-        # 计算梯度：虽然 Loss 是在 x_trans 上计算的，但我们对 x_adv 求导
-        # autograd 会自动将梯度从 x_trans 逆变换回 x_adv (原图空间)
-        # 这样计算出的 grad 就可以直接加在原图 x_adv 上，符合“扰动在DE处理后的图片上得到，加在原图上”的要求
+        loss = F.cross_entropy(output, y_repeated)
+
+        # Compute gradient
+        # autograd will aggregate gradients from all copies back to x_adv
         grad = torch.autograd.grad(loss, [x_adv])[0]
         grad = grad / (torch.mean(torch.abs(grad), dim=(1, 2, 3), keepdim=True) + 1e-8)
 
@@ -524,7 +547,7 @@ def ldr_attack(x, y, model, eps=16/255, iterations=10, mu=1.0,
         x_adv = x_adv.detach() + alpha * torch.sign(momentum)
         delta = torch.clamp(x_adv - x, min=-eps, max=eps)
         x_adv = torch.clamp(x + delta, 0, 1)
-        
+
     return x_adv.detach()
 
 def parse_args():
