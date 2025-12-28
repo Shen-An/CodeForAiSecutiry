@@ -368,6 +368,7 @@ def evaluate_fitness(model, x, y, pop_r, pop_c, pop_k, block_size, enable_rotati
 def ldr_attack(x, y, model, eps=16/255, iterations=10, mu=1.0, 
                de_pop_size=5, de_generations=5, de_prob_m=0.5, de_prob_c=0.8,
                block_size=1, enable_rotation=False):
+
     """
     LDR Attack (Block-level) using Differential Evolution.
     """
@@ -472,6 +473,15 @@ def ldr_attack(x, y, model, eps=16/255, iterations=10, mu=1.0,
                 best_c[b] = pop_c[idx][b]
                 if enable_rotation:
                     best_k[b] = pop_k[idx][b]
+        # --- 插入监控代码开始 ---
+        if (g + 1) % 1 == 0:  # 每一代都打印，方便观察
+            avg_best_loss = best_fitness.mean()
+            # 这里的 5.0 是一个经验阈值（Inception通常Loss到3-5以上就很稳了）
+            print(f"    [DE Gen {g+1}/{de_generations}] Avg Best Loss: {avg_best_loss:.4f}")
+        # --- 插入监控代码结束 ---
+
+    # 循环结束后，可以加一个最终统计
+    print(f"  >> DE Optimization Finished. Final Avg Best Loss: {best_fitness.mean():.4f}")            
 
     # --- Step 2: MI-FGSM with Learned Permutation & Rotation ---
     x_adv = x.clone().detach()
@@ -592,7 +602,7 @@ def main_cli():
         y_batch = y_batch.to(device)
 
         source_orig_preds = get_model_prediction(source_model, x_batch)
-        
+        print(f"True Label: {y_batch[0].item()}, Model Pred: {source_orig_preds[0]}")
         # Run LDR Attack
         x_adv_batch = ldr_attack(x_batch, y_batch, source_model, **attack_params)
         
