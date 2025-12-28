@@ -485,65 +485,45 @@ def ldr_attack(x, y, model, eps=16/255, iterations=10, mu=1.0,
     print(f"  >> DE Optimization Finished. Final Avg Best Loss: {best_fitness.mean():.4f}")            
 
     # --- Step 2: MI-FGSM with Learned Permutation & Rotation ---
-    # x_adv = x.clone().detach()
-    # alpha = eps / max(iterations, 1)
-    # momentum = torch.zeros_like(x_adv, device=device)
-    #
-    # --- Step 2: 暂时跳过 MI-FGSM，直接测试 DE 的乱序结果 ---
+    x_adv = x.clone().detach()
+    alpha = eps / max(iterations, 1)
+    momentum = torch.zeros_like(x_adv, device=device)
+
     # Convert best perms to torch indices
     idx_r = torch.from_numpy(best_r).long().to(device)
     idx_c = torch.from_numpy(best_c).long().to(device)
-    k_map = torch.from_numpy(best_k).long().to(device) if enable_rotation else None
+    
+    if enable_rotation and best_k is not None:
+        k_map = torch.from_numpy(best_k).long().to(device)
+    else:
+        k_map = None
 
-    # 直接返回经过乱序处理的原始像素图像
-    x_adv = apply_block_transformation(x, idx_r, idx_c, block_size, k_map, enable_rotation)
-    # --- 诊断代码：检查 DE 阶段后的白盒效果 ---
-    with torch.no_grad():
-        # 使用 DE 找到的最优排列处理原始图像
-        x_de_final = apply_block_transformation(x_de, idx_r, idx_c, block_size, k_map, enable_rotation)
-        output_de = get_model_output(model, x_de_final)
+    for _ in range(iterations):
+        x_adv.requires_grad_(True)
 
-        # 打印预测结果和真实标签
-        print(f"\n[Diagnostic] Batch DE Results:")
-        print(f"  True Labels: {y[:8].cpu().numpy()}")  # 只打印前8个防止刷屏
-        print(f"  Preds after DE: {torch.argmax(output_de, dim=1)[:8].cpu().numpy()}")
+        # Apply transformation: Tau(x) = R * x * C
+        # idx_r, idx_c are (B, n_h) and (B, n_w)
+        # 这里的 x_trans 就是“DE处理后的图片”
+        x_trans = apply_block_transformation(x_adv, idx_r, idx_c, block_size, k_map, enable_rotation)
 
-        # 计算这一个 Batch 的 DE 阶段成功率
-        de_success = (torch.argmax(output_de, dim=1) != y).float().mean().item()
-        print(f"  DE-only Success Rate: {de_success * 100:.1f}%")
-    # --- 诊断代码结束 ---
-    return x_adv.detach()
+        output = get_model_output(model, x_trans)
+        if output.dim() == 1:
+            output = output.unsqueeze(0)
+        elif output.dim() > 2:
+            output = output.view(output.size(0), -1)
 
+        loss = F.cross_entropy(output, y)
 
+        # 计算梯度：虽然 Loss 是在 x_trans 上计算的，但我们对 x_adv 求导
+        # autograd 会自动将梯度从 x_trans 逆变换回 x_adv (原图空间)
+        # 这样计算出的 grad 就可以直接加在原图 x_adv 上，符合“扰动在DE处理后的图片上得到，加在原图上”的要求
+        grad = torch.autograd.grad(loss, [x_adv])[0]
+        grad = grad / (torch.mean(torch.abs(grad), dim=(1, 2, 3), keepdim=True) + 1e-8)
 
-    # 接下来的 MI-FGSM 部分...
-    # if enable_rotation and best_k is not None:
-    #     k_map = torch.from_numpy(best_k).long().to(device)
-    # else:
-    #     k_map = None
-    #
-    # for _ in range(iterations):
-    #     x_adv.requires_grad_(True)
-    #
-    #     # Apply transformation: Tau(x) = R * x * C
-    #     # idx_r, idx_c are (B, n_h) and (B, n_w)
-    #     x_trans = apply_block_transformation(x_adv, idx_r, idx_c, block_size, k_map, enable_rotation)
-    #
-    #     output = get_model_output(model, x_trans)
-    #     if output.dim() == 1:
-    #         output = output.unsqueeze(0)
-    #     elif output.dim() > 2:
-    #         output = output.view(output.size(0), -1)
-    #
-    #     loss = F.cross_entropy(output, y)
-    #
-    #     grad = torch.autograd.grad(loss, [x_adv])[0]
-    #     grad = grad / (torch.mean(torch.abs(grad), dim=(1, 2, 3), keepdim=True) + 1e-8)
-    #
-    #     momentum = mu * momentum + grad
-    #     x_adv = x_adv.detach() + alpha * torch.sign(momentum)
-    #     delta = torch.clamp(x_adv - x, min=-eps, max=eps)
-    #     x_adv = torch.clamp(x + delta, 0, 1)
+        momentum = mu * momentum + grad
+        x_adv = x_adv.detach() + alpha * torch.sign(momentum)
+        delta = torch.clamp(x_adv - x, min=-eps, max=eps)
+        x_adv = torch.clamp(x + delta, 0, 1)
         
     return x_adv.detach()
 
