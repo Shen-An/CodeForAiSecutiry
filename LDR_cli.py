@@ -6,6 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
+from torchvision.utils import save_image
 from PIL import Image
 from tqdm import tqdm
 from models import ModelRepository, Normalize
@@ -406,7 +407,7 @@ def ldr_attack(x, y, model, eps=16/255, iterations=10, mu=1.0,
         idx = best_indices[b]
         best_r[b] = pop_r[idx][b]
         best_c[b] = pop_c[idx][b]
-        if enable_rotation:
+        if enable_rotation and best_k is not None and pop_k[idx] is not None:
             best_k[b] = pop_k[idx][b]
     
     for g in range(de_generations):
@@ -454,7 +455,7 @@ def ldr_attack(x, y, model, eps=16/255, iterations=10, mu=1.0,
             if improved.any():
                 pop_r[i][improved] = new_pop_r[i][improved]
                 pop_c[i][improved] = new_pop_c[i][improved]
-                if enable_rotation:
+                if enable_rotation and pop_k[i] is not None and new_pop_k[i] is not None:
                     pop_k[i][improved] = new_pop_k[i][improved]
                 
                 fitness[i][improved] = new_fitness[i][improved]
@@ -471,7 +472,7 @@ def ldr_attack(x, y, model, eps=16/255, iterations=10, mu=1.0,
                 idx = current_best_indices[b]
                 best_r[b] = pop_r[idx][b]
                 best_c[b] = pop_c[idx][b]
-                if enable_rotation:
+                if enable_rotation and best_k is not None and pop_k[idx] is not None:
                     best_k[b] = pop_k[idx][b]
         # --- 插入监控代码开始 ---
         if (g + 1) % 1 == 0:  # 每一代都打印，方便观察
@@ -496,8 +497,26 @@ def ldr_attack(x, y, model, eps=16/255, iterations=10, mu=1.0,
 
     # 直接返回经过乱序处理的原始像素图像
     x_adv = apply_block_transformation(x, idx_r, idx_c, block_size, k_map, enable_rotation)
+    # --- 诊断代码：检查 DE 阶段后的白盒效果 ---
+    with torch.no_grad():
+        # 使用 DE 找到的最优排列处理原始图像
+        x_de_final = apply_block_transformation(x_de, idx_r, idx_c, block_size, k_map, enable_rotation)
+        output_de = get_model_output(model, x_de_final)
+
+        # 打印预测结果和真实标签
+        print(f"\n[Diagnostic] Batch DE Results:")
+        print(f"  True Labels: {y[:8].cpu().numpy()}")  # 只打印前8个防止刷屏
+        print(f"  Preds after DE: {torch.argmax(output_de, dim=1)[:8].cpu().numpy()}")
+
+        # 计算这一个 Batch 的 DE 阶段成功率
+        de_success = (torch.argmax(output_de, dim=1) != y).float().mean().item()
+        print(f"  DE-only Success Rate: {de_success * 100:.1f}%")
+    # --- 诊断代码结束 ---
     return x_adv.detach()
 
+
+
+    # 接下来的 MI-FGSM 部分...
     # if enable_rotation and best_k is not None:
     #     k_map = torch.from_numpy(best_k).long().to(device)
     # else:
@@ -543,6 +562,7 @@ def parse_args():
     parser.add_argument('--block_size', default=1, type=int, help='block size for LDR')
     parser.add_argument('--enable_rotation', action='store_true', help='enable rotation in LDR')
     parser.add_argument('--output_csv', default='./attack_results_LDR.csv', type=str, help='output CSV path')
+    parser.add_argument('--output_dir', default='./output_adv', type=str, help='directory to save adversarial images')
     parser.add_argument('--GPU_ID', default='0', type=str, help='CUDA device id, e.g., 0')
     return parser.parse_args()
 
@@ -589,6 +609,10 @@ def main_cli():
     loader = DataLoader(dataset, batch_size=args.batchsize, shuffle=False, num_workers=0)
     print(f"Total {len(label_df)} valid images, using batch_size={args.batchsize}")
 
+    if not os.path.exists(args.output_dir):
+        os.makedirs(args.output_dir)
+        print(f"Created output directory: {args.output_dir}")
+
     attack_params = {
         "eps": args.eps, 
         "iterations": args.iterations, 
@@ -612,6 +636,11 @@ def main_cli():
         # Run LDR Attack
         x_adv_batch = ldr_attack(x_batch, y_batch, source_model, **attack_params)
         
+        # Save adversarial images
+        for i in range(len(filename_batch)):
+            save_path = os.path.join(args.output_dir, filename_batch[i])
+            save_image(x_adv_batch[i].cpu(), save_path)
+
         source_adv_preds = get_model_prediction(source_model, x_adv_batch)
 
         target_batch_preds = {}
