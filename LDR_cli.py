@@ -2,6 +2,7 @@ import os
 import argparse
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
@@ -89,8 +90,8 @@ def apply_block_transformation(x, idx_r, idx_c, block_size, k_map=None, enable_r
     """
     Apply block-level permutation and optional rotation.
     x: (B, C, H, W)
-    idx_r: (Nh,) tensor of row block indices
-    idx_c: (Nw,) tensor of col block indices
+    idx_r: (B, Nh) or (Nh,) tensor of row block indices
+    idx_c: (B, Nw) or (Nw,) tensor of col block indices
     block_size: int
     k_map: (B, Nh, Nw) tensor of rotation types (0-3), optional.
     enable_rotation: bool
@@ -114,9 +115,42 @@ def apply_block_transformation(x, idx_r, idx_c, block_size, k_map=None, enable_r
     x_blocks = x_padded.view(B, C, n_h, block_size, n_w, block_size)
     
     # 3. Permute blocks
-    # idx_r and idx_c must be on the same device as x
-    # We apply the permutation to the block indices (dim 2 and dim 4)
-    x_perm = x_blocks[:, :, idx_r, :, :, :][:, :, :, :, idx_c, :]
+    # Handle idx_r and idx_c broadcasting
+    if idx_r.dim() == 1:
+        idx_r = idx_r.unsqueeze(0).expand(B, -1)
+    if idx_c.dim() == 1:
+        idx_c = idx_c.unsqueeze(0).expand(B, -1)
+        
+    # Use Advanced Indexing for efficient permutation
+    
+    # 1. Row permutation (dim 2)
+    # x_blocks: (B, C, n_h, block_size, n_w, block_size)
+    # We want to permute dim 2 based on idx_r (B, n_h)
+    
+    ib = torch.arange(B, device=x.device).view(B, 1, 1)
+    ic = torch.arange(C, device=x.device).view(1, C, 1)
+    ir = idx_r.view(B, 1, n_h)
+    
+    # Result shape: (B, C, n_h, block_size, n_w, block_size)
+    x_perm = x_blocks[ib, ic, ir]
+    
+    # 2. Col permutation (dim 4)
+    # We want to permute dim 4 based on idx_c (B, n_w)
+    # To avoid complex 6D indexing, we permute dim 4 to dim 1, index, then permute back.
+    
+    # (B, C, n_h, block_size, n_w, block_size) -> (B, n_w, C, n_h, block_size, block_size)
+    x_perm = x_perm.permute(0, 4, 1, 2, 3, 5)
+    
+    ib = torch.arange(B, device=x.device).view(B, 1)
+    ic_col = idx_c.view(B, n_w)
+    
+    # Indexing dim 1 (n_w) with (B, n_w)
+    # Result: (B, n_w, C, n_h, block_size, block_size)
+    x_perm = x_perm[ib, ic_col]
+    
+    # Permute back: (B, n_w, C, n_h, block_size, block_size) -> (B, C, n_h, block_size, n_w, block_size)
+    # Dims: 0, 2, 3, 4, 1, 5
+    x_perm = x_perm.permute(0, 2, 3, 4, 1, 5)
     
     # 4. Optional Rotation
     if enable_rotation:
@@ -163,16 +197,35 @@ def apply_block_transformation(x, idx_r, idx_c, block_size, k_map=None, enable_r
         
     return x_out
 
-# --- Differential Evolution (DE) Helper Functions ---
+def init_population_batch(pop_size, length, batch_size, device='cpu'):
+    """Initialize population with random permutations for each batch sample."""
+    # Use torch for faster generation on GPU if available, then convert to numpy
+    # Returns list of (B, length) arrays
+    population = []
+    # Generate random values: (pop_size, batch_size, length)
+    rand_vals = torch.rand(pop_size, batch_size, length, device=device)
+    # Argsort to get permutations
+    perms_tensor = torch.argsort(rand_vals, dim=-1)
+    
+    # Convert to numpy list of arrays
+    perms_np = perms_tensor.cpu().numpy()
+    for i in range(pop_size):
+        population.append(perms_np[i])
+        
+    return population
 
-def init_population(pop_size, length):
-    """Initialize population with random permutations."""
-    return [np.random.permutation(length) for _ in range(pop_size)]
-
-def init_rotation_population(pop_size, n_h, n_w):
-    """Initialize population of rotation maps."""
-    # Each individual has a (1, n_h, n_w) rotation map (integers 0-3)
-    return [np.random.randint(0, 4, (1, n_h, n_w)) for _ in range(pop_size)]
+def init_rotation_population_batch(pop_size, n_h, n_w, batch_size, device='cpu'):
+    """Initialize population of rotation maps for each batch sample."""
+    # Returns list of (B, n_h, n_w) arrays
+    # Generate random integers 0-3
+    rot_tensor = torch.randint(0, 4, (pop_size, batch_size, n_h, n_w), device=device)
+    
+    rot_np = rot_tensor.cpu().numpy()
+    population = []
+    for i in range(pop_size):
+        population.append(rot_np[i])
+        
+    return population
 
 def mutation_perm(r1, r2, r3, prob_m):
     """
@@ -210,6 +263,13 @@ def mutation_perm(r1, r2, r3, prob_m):
             mutant[idx_a], mutant[idx_b] = mutant[idx_b], mutant[idx_a]
             
     return mutant
+
+def mutation_perm_batch(r1_batch, r2_batch, r3_batch, prob_m):
+    B = r1_batch.shape[0]
+    mutants = []
+    for b in range(B):
+        mutants.append(mutation_perm(r1_batch[b], r2_batch[b], r3_batch[b], prob_m))
+    return np.array(mutants)
 
 def mutation_rot(r1, r2, r3, prob_m):
     """
@@ -251,6 +311,13 @@ def crossover(parent1, parent2, prob):
     
     return child
 
+def crossover_perm_batch(parent1_batch, parent2_batch, prob):
+    B = parent1_batch.shape[0]
+    children = []
+    for b in range(B):
+        children.append(crossover(parent1_batch[b], parent2_batch[b], prob))
+    return np.array(children)
+
 def crossover_rot(parent1, parent2, prob):
     """Uniform crossover for rotation maps."""
     if np.random.rand() >= prob:
@@ -262,15 +329,15 @@ def crossover_rot(parent1, parent2, prob):
     return child
 
 def evaluate_fitness(model, x, y, pop_r, pop_c, pop_k, block_size, enable_rotation=False):
-    """Evaluate fitness of the population (CrossEntropyLoss)."""
+    """Evaluate fitness of the population (CrossEntropyLoss) per sample."""
     fitness_scores = []
     device = x.device
     
     # We evaluate each individual in the population
     for i in range(len(pop_r)):
-        r = pop_r[i]
-        c = pop_c[i]
-        k = pop_k[i] if enable_rotation else None
+        r = pop_r[i] # (B, n_h)
+        c = pop_c[i] # (B, n_w)
+        k = pop_k[i] if enable_rotation else None # (B, n_h, n_w)
         
         idx_r = torch.from_numpy(r).long().to(device)
         idx_c = torch.from_numpy(c).long().to(device)
@@ -290,10 +357,11 @@ def evaluate_fitness(model, x, y, pop_r, pop_c, pop_k, block_size, enable_rotati
             elif output.dim() > 2:
                 output = output.view(output.size(0), -1)
             
-            loss = F.cross_entropy(output, y, reduction='sum')
-            fitness_scores.append(loss.item())
+            # Use reduction='none' to get loss per sample
+            loss = F.cross_entropy(output, y, reduction='none')
+            fitness_scores.append(loss.cpu().numpy())
             
-    return fitness_scores
+    return np.array(fitness_scores) # (pop_size, B)
 
 def ldr_attack(x, y, model, eps=16/255, iterations=10, mu=1.0, 
                de_pop_size=5, de_generations=5, de_prob_m=0.5, de_prob_c=0.8,
@@ -304,6 +372,9 @@ def ldr_attack(x, y, model, eps=16/255, iterations=10, mu=1.0,
     device = x.device
     B, C, H, W = x.shape
     
+    # Ensure x is detached for DE phase to avoid memory leaks
+    x_de = x.detach()
+    
     # Determine grid size
     h_pad = (block_size - H % block_size) % block_size
     w_pad = (block_size - W % block_size) % block_size
@@ -311,19 +382,29 @@ def ldr_attack(x, y, model, eps=16/255, iterations=10, mu=1.0,
     n_w = (W + w_pad) // block_size
     
     # --- Step 1: DE Optimization for Permutations & Rotation ---
-    # Initialize population
-    pop_r = init_population(de_pop_size, n_h)
-    pop_c = init_population(de_pop_size, n_w)
-    pop_k = init_rotation_population(de_pop_size, n_h, n_w) if enable_rotation else [None]*de_pop_size
+    # Initialize population (Batch-aware) - Use GPU for initialization
+    pop_r = init_population_batch(de_pop_size, n_h, B, device=device)
+    pop_c = init_population_batch(de_pop_size, n_w, B, device=device)
+    pop_k = init_rotation_population_batch(de_pop_size, n_h, n_w, B, device=device) if enable_rotation else [None]*de_pop_size
     
-    # Initial fitness
-    fitness = evaluate_fitness(model, x, y, pop_r, pop_c, pop_k, block_size, enable_rotation)
+    # Initial fitness: (pop_size, B)
+    fitness = evaluate_fitness(model, x_de, y, pop_r, pop_c, pop_k, block_size, enable_rotation)
     
-    best_idx = np.argmax(fitness)
-    best_r = pop_r[best_idx]
-    best_c = pop_c[best_idx]
-    best_k = pop_k[best_idx]
-    best_fitness = fitness[best_idx]
+    # Track best per sample
+    best_indices = np.argmax(fitness, axis=0) # (B,)
+    best_fitness = np.max(fitness, axis=0) # (B,)
+    
+    # Construct initial bests
+    best_r = np.zeros((B, n_h), dtype=int)
+    best_c = np.zeros((B, n_w), dtype=int)
+    best_k = np.zeros((B, n_h, n_w), dtype=int) if enable_rotation else None
+    
+    for b in range(B):
+        idx = best_indices[b]
+        best_r[b] = pop_r[idx][b]
+        best_c[b] = pop_c[idx][b]
+        if enable_rotation:
+            best_k[b] = pop_k[idx][b]
     
     for g in range(de_generations):
         new_pop_r = []
@@ -335,20 +416,22 @@ def ldr_attack(x, y, model, eps=16/255, iterations=10, mu=1.0,
             idxs = [idx for idx in range(de_pop_size) if idx != i]
             r1, r2, r3 = np.random.choice(idxs, 3, replace=False)
             
-            # Mutation
-            v_r = mutation_perm(pop_r[r1], pop_r[r2], pop_r[r3], de_prob_m)
-            v_c = mutation_perm(pop_c[r1], pop_c[r2], pop_c[r3], de_prob_m)
+            # Mutation (Batch)
+            v_r = mutation_perm_batch(pop_r[r1], pop_r[r2], pop_r[r3], de_prob_m)
+            v_c = mutation_perm_batch(pop_c[r1], pop_c[r2], pop_c[r3], de_prob_m)
             
             if enable_rotation:
+                # mutation_rot works with (B, ...) arrays directly
                 v_k = mutation_rot(pop_k[r1], pop_k[r2], pop_k[r3], de_prob_m)
             else:
                 v_k = None
             
-            # Crossover
-            u_r = crossover(pop_r[i], v_r, de_prob_c)
-            u_c = crossover(pop_c[i], v_c, de_prob_c)
+            # Crossover (Batch)
+            u_r = crossover_perm_batch(pop_r[i], v_r, de_prob_c)
+            u_c = crossover_perm_batch(pop_c[i], v_c, de_prob_c)
             
             if enable_rotation:
+                # crossover_rot works with (B, ...) arrays directly
                 u_k = crossover_rot(pop_k[i], v_k, de_prob_c)
             else:
                 u_k = None
@@ -358,24 +441,35 @@ def ldr_attack(x, y, model, eps=16/255, iterations=10, mu=1.0,
             new_pop_k.append(u_k)
             
         # Evaluate candidates
-        new_fitness = evaluate_fitness(model, x, y, new_pop_r, new_pop_c, new_pop_k, block_size, enable_rotation)
+        new_fitness = evaluate_fitness(model, x_de, y, new_pop_r, new_pop_c, new_pop_k, block_size, enable_rotation)
         
-        # Selection (Greedy)
+        # Selection (Greedy per sample)
         for i in range(de_pop_size):
-            if new_fitness[i] > fitness[i]:
-                pop_r[i] = new_pop_r[i]
-                pop_c[i] = new_pop_c[i]
-                pop_k[i] = new_pop_k[i]
-                fitness[i] = new_fitness[i]
+            # improved: (B,) boolean mask
+            improved = new_fitness[i] > fitness[i]
+            
+            if improved.any():
+                pop_r[i][improved] = new_pop_r[i][improved]
+                pop_c[i][improved] = new_pop_c[i][improved]
+                if enable_rotation:
+                    pop_k[i][improved] = new_pop_k[i][improved]
+                
+                fitness[i][improved] = new_fitness[i][improved]
         
         # Update global best
-        current_best_idx = np.argmax(fitness)
-        if fitness[current_best_idx] > best_fitness:
-            best_idx = current_best_idx
-            best_r = pop_r[best_idx]
-            best_c = pop_c[best_idx]
-            best_k = pop_k[best_idx]
-            best_fitness = fitness[best_idx]
+        current_best_indices = np.argmax(fitness, axis=0) # (B,)
+        current_best_fitness = np.max(fitness, axis=0) # (B,)
+        
+        improved_best = current_best_fitness > best_fitness
+        if improved_best.any():
+            best_fitness[improved_best] = current_best_fitness[improved_best]
+            # Update best_r, best_c, best_k for improved samples
+            for b in np.where(improved_best)[0]:
+                idx = current_best_indices[b]
+                best_r[b] = pop_r[idx][b]
+                best_c[b] = pop_c[idx][b]
+                if enable_rotation:
+                    best_k[b] = pop_k[idx][b]
 
     # --- Step 2: MI-FGSM with Learned Permutation & Rotation ---
     x_adv = x.clone().detach()
@@ -388,9 +482,6 @@ def ldr_attack(x, y, model, eps=16/255, iterations=10, mu=1.0,
     
     if enable_rotation and best_k is not None:
         k_map = torch.from_numpy(best_k).long().to(device)
-        # Expand k_map to batch size if necessary (it is 1, Nh, Nw)
-        if k_map.shape[0] != B:
-             k_map = k_map.expand(B, -1, -1)
     else:
         k_map = None
     
@@ -398,7 +489,7 @@ def ldr_attack(x, y, model, eps=16/255, iterations=10, mu=1.0,
         x_adv.requires_grad_(True)
         
         # Apply transformation: Tau(x) = R * x * C
-        # CRITICAL FIX: Pass the FIXED k_map here to avoid random rotation jitter
+        # idx_r, idx_c are (B, n_h) and (B, n_w)
         x_trans = apply_block_transformation(x_adv, idx_r, idx_c, block_size, k_map, enable_rotation)
         
         output = get_model_output(model, x_trans)
@@ -423,7 +514,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description='LDR Attack')
     parser.add_argument('--input_dir', default='./data', type=str, help='input directory')
     parser.add_argument('--model', default='tf2torch_inception_v3', type=str, help='source model name')
-    parser.add_argument('--batchsize', default=1, type=int, help='batch size')
+    parser.add_argument('--batchsize', default=4, type=int, help='batch size')
     parser.add_argument('--eps', default=16/255, type=float, help='epsilon for attack')
     parser.add_argument('--iterations', default=10, type=int, help='number of iterations for attack')
     parser.add_argument('--mu', default=1.0, type=float, help='momentum for attack')
