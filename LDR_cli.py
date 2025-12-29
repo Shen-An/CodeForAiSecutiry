@@ -585,35 +585,14 @@ def ldr_attack(x, y, source_models, eps=16/255, iterations=10, mu=1.0,
         # Apply Input Diversity
         x_div = input_diversity(x_adv, prob=prob)
 
-        # Create batch of N augmented images
-        # 1. Repeat x_adv: (B, C, H, W) -> (B*N, C, H, W)
-        # This creates N copies of the batch stacked along dim 0
-        x_inputs = x_div.repeat(num_augmentations, 1, 1, 1)
         
-        # 2. Prepare indices for the augmented batch
-        # We want the first copy (B images) to use the DE-optimized indices
-        # The remaining N-1 copies ((N-1)*B images) to use random indices
-        
-        num_rand = (num_augmentations - 1) * B
-        
-        # Generate random indices for the rest
-        rand_r = torch.rand(num_rand, n_h, device=device)
-        idx_r_rand = torch.argsort(rand_r, dim=-1)
-        
-        rand_c = torch.rand(num_rand, n_w, device=device)
-        idx_c_rand = torch.argsort(rand_c, dim=-1)
-        
-        # Concatenate best indices with random indices
-        idx_r_all = torch.cat([idx_r_best, idx_r_rand], dim=0)
-        idx_c_all = torch.cat([idx_c_best, idx_c_rand], dim=0)
-        
+        x_inputs = x_div       # 不再 repeat
+
+        # 索引部分也只取最优的
+        idx_r_all = idx_r_best
+        idx_c_all = idx_c_best
         if enable_rotation:
-            if k_map_best is not None:
-                k_map_rand = torch.randint(0, 4, (num_rand, n_h, n_w), device=device)
-                k_map_all = torch.cat([k_map_best, k_map_rand], dim=0)
-            else:
-                # Fallback if k_map_best is None but rotation enabled
-                k_map_all = torch.randint(0, 4, (B * num_augmentations, n_h, n_w), device=device)
+            k_map_all = k_map_best
         else:
             k_map_all = None
 
