@@ -572,6 +572,10 @@ def ldr_attack(x, y, source_models, eps=16/255, iterations=10, mu=1.0,
     else:
         k_map_best = None
 
+    # Generate transformed image for saving
+    with torch.no_grad():
+        x_best_trans = apply_block_transformation(x, idx_r_best, idx_c_best, block_size, k_map_best, enable_rotation)
+
     # Number of augmentations for gradient averaging (BSR style)
     num_augmentations = 20
 
@@ -642,7 +646,7 @@ def ldr_attack(x, y, source_models, eps=16/255, iterations=10, mu=1.0,
         delta = torch.clamp(x_adv - x, min=-eps, max=eps)
         x_adv = torch.clamp(x + delta, 0, 1)
 
-    return x_adv.detach()
+    return x_adv.detach(), x_best_trans.detach()
 
 def parse_args():
     parser = argparse.ArgumentParser(description='LDR Attack')
@@ -751,12 +755,19 @@ def main_cli():
         source_orig_preds = get_model_prediction(source_model, x_batch)
         print(f"True Label: {y_batch[0].item()}, Model Pred: {source_orig_preds[0]}")
         # Run LDR Attack
-        x_adv_batch = ldr_attack(x_batch, y_batch, ensemble_models, **attack_params)
+        x_adv_batch, x_trans_batch = ldr_attack(x_batch, y_batch, ensemble_models, **attack_params)
         
         # Save adversarial images
+        trans_dir = os.path.join(args.output_dir, 'transformed')
+        if not os.path.exists(trans_dir):
+            os.makedirs(trans_dir)
+
         for i in range(len(filename_batch)):
             save_path = os.path.join(args.output_dir, filename_batch[i])
             save_image(x_adv_batch[i].cpu(), save_path)
+
+            save_path_trans = os.path.join(trans_dir, filename_batch[i])
+            save_image(x_trans_batch[i].cpu(), save_path_trans)
 
         source_adv_preds = get_model_prediction(source_model, x_adv_batch)
 
