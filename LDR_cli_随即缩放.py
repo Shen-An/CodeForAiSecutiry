@@ -382,63 +382,9 @@ def evaluate_fitness(models_list, x, y, pop_r, pop_c, pop_k, block_size, enable_
             
     return np.array(fitness_scores) # (pop_size, B)
 
-def input_diversity(x, prob=0.5):
-    """
-    New input_diversity Logic:
-    * Divide the input tensor x (size 299x299) into a 2x2 grid (4 patches).
-    * For each patch, apply a random rescale factor between 0.9 and 1.1.
-    * Use F.interpolate with mode='bilinear' and align_corners=False to resize each patch back to its original quadrant size.
-    * Reassemble the 4 patches back into a single 299x299 image.
-    * Apply a final global F.interpolate (bilinear) to the reassembled image to smooth the seams between blocks.
-    """
-    if prob <= 0.0:
-        return x
-    
-    if np.random.rand() > prob:
-        return x
-        
-    B, C, H, W = x.shape
-    
-    # Calculate split points (approx middle)
-    h_split = H // 2 + (1 if H % 2 != 0 else 0)
-    w_split = W // 2 + (1 if W % 2 != 0 else 0)
-    
-    # Extract quadrants
-    q1 = x[:, :, :h_split, :w_split]
-    q2 = x[:, :, :h_split, w_split:]
-    q3 = x[:, :, h_split:, :w_split]
-    q4 = x[:, :, h_split:, w_split:]
-    
-    quadrants = [q1, q2, q3, q4]
-    processed = []
-    
-    for q in quadrants:
-        qh, qw = q.shape[2], q.shape[3]
-        # Random rescale factor 0.9 - 1.1
-        factor = 0.9 + (1.1 - 0.9) * torch.rand(1, device=x.device).item()
-        
-        target_h = int(qh * factor)
-        target_w = int(qw * factor)
-        
-        # Resize to target and back
-        # mode='bilinear', align_corners=False
-        q_scaled = F.interpolate(q, size=(target_h, target_w), mode='bilinear', align_corners=False)
-        q_back = F.interpolate(q_scaled, size=(qh, qw), mode='bilinear', align_corners=False)
-        processed.append(q_back)
-        
-    # Reassemble
-    top = torch.cat([processed[0], processed[1]], dim=3)
-    bottom = torch.cat([processed[2], processed[3]], dim=3)
-    reassembled = torch.cat([top, bottom], dim=2)
-    
-    # Final global smoothing
-    final = F.interpolate(reassembled, size=(H, W), mode='bilinear', align_corners=False)
-    
-    return final
-
 def ldr_attack(x, y, source_models, eps=16/255, iterations=10, mu=1.0, 
                de_pop_size=5, de_generations=5, de_prob_m=0.5, de_prob_c=0.8,
-               block_size=1, enable_rotation=False, prob=0.5):
+               block_size=1, enable_rotation=False):
 
     """
     LDR Attack (Block-level) using Differential Evolution.
@@ -578,13 +524,10 @@ def ldr_attack(x, y, source_models, eps=16/255, iterations=10, mu=1.0,
     for _ in range(iterations):
         x_adv.requires_grad_(True)
 
-        # Apply Input Diversity
-        x_div = input_diversity(x_adv, prob=prob)
-
         # Create batch of N augmented images
         # 1. Repeat x_adv: (B, C, H, W) -> (B*N, C, H, W)
         # This creates N copies of the batch stacked along dim 0
-        x_inputs = x_div.repeat(num_augmentations, 1, 1, 1)
+        x_inputs = x_adv.repeat(num_augmentations, 1, 1, 1)
         
         # 2. Prepare indices for the augmented batch
         # We want the first copy (B images) to use the DE-optimized indices
@@ -658,7 +601,6 @@ def parse_args():
     parser.add_argument('--de_prob_c', default=0.8, type=float, help='DE crossover probability')
     parser.add_argument('--block_size', default=1, type=int, help='block size for LDR')
     parser.add_argument('--enable_rotation', action='store_true', help='enable rotation in LDR')
-    parser.add_argument('--prob', default=0.5, type=float, help='input diversity probability')
     parser.add_argument('--output_csv', default='./attack_results_LDR.csv', type=str, help='output CSV path')
     parser.add_argument('--output_dir', default='./output_adv', type=str, help='directory to save adversarial images')
     parser.add_argument('--GPU_ID', default='0', type=str, help='CUDA device id, e.g., 0')
@@ -738,8 +680,7 @@ def main_cli():
         "de_prob_m": args.de_prob_m,
         "de_prob_c": args.de_prob_c,
         "block_size": args.block_size,
-        "enable_rotation": args.enable_rotation,
-        "prob": args.prob
+        "enable_rotation": args.enable_rotation
     }
 
     results = []
