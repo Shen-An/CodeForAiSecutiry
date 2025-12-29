@@ -23,7 +23,7 @@ class AttackDataset(Dataset):
     def __getitem__(self, idx):
         row = self.label_df.iloc[idx]
         img_filename = row["filename"]
-        true_label = int(row["label"]) + 1  # 与模型标签对齐
+        true_label = int(row["label"]) 
         img_path = os.path.join(self.img_root, img_filename)
         img = Image.open(img_path).convert("RGB")
         x = self.transform(img)
@@ -766,11 +766,11 @@ def main_cli():
             target_batch_preds[model_name] = get_model_prediction(model, x_adv_batch)
 
         for i in range(x_batch.size(0)):
-            true_label = int(y_batch[i].item())
+            true_label = int(y_batch[i].item()) +1
             entry = {
                 "filename": filename_batch[i],
                 "true_label": true_label,
-                "source_original_pred": int(source_orig_preds[i]),
+                "source_original_pred": int(source_orig_preds[i]) +1,
                 "source_adv_pred": int(source_adv_preds[i]),
                 "source_attack_success": int(source_adv_preds[i]) != true_label,
                 "target_results": {}
