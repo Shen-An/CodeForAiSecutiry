@@ -85,7 +85,8 @@ def load_source_model(model_name, device, model_repo):
         return model
     else:
         print(f"Loading model from repository: {model_name}")
-        return model_repo.get_source_model(model_name)['model']
+        # 直接使用 _load_model 以支持在清空 model_repo.models 后加载
+        return model_repo._load_model(model_name)
 
 # --- Block-level Transformation Helper ---
 
@@ -379,6 +380,8 @@ def evaluate_fitness(models_list, x, y, pop_r, pop_c, pop_k, block_size, enable_
             score = sum_loss - variance_term
             
             fitness_scores.append(score.cpu().numpy())
+            # 新增：手动删除临时的大张量
+            del x_perm, losses_list, score
             
     return np.array(fitness_scores) # (pop_size, B)
 
@@ -520,7 +523,7 @@ def ldr_attack(x, y, source_models, eps=16/255, iterations=10, mu=1.0,
             
         # Evaluate candidates
         new_fitness = evaluate_fitness(source_models, x_de, y, new_pop_r, new_pop_c, new_pop_k, block_size, enable_rotation)
-        
+        torch.cuda.empty_cache()
         # Selection (Greedy per sample)
         for i in range(de_pop_size):
             # improved: (B,) boolean mask
@@ -654,6 +657,16 @@ def main_cli():
 
     model_repo = ModelRepository(device)
     
+    # 获取所有模型名称
+    all_models = model_repo.get_all_model_names()
+    print(f"Available models: {all_models}")
+    
+    # 关键修改：清空 ModelRepository 中的缓存模型以释放显存
+    # 因为 ModelRepository 在初始化时加载了所有模型，导致显存爆炸 (73GB+)
+    model_repo.models.clear()
+    torch.cuda.empty_cache()
+    print("Cleared ModelRepository cache to save memory.")
+
     # 使用新的加载逻辑
     try:
         source_model = load_source_model(args.model, device, model_repo)
@@ -664,8 +677,7 @@ def main_cli():
     # Prepare Ensemble
     ensemble_models = [source_model]
     # Load auxiliary models for ensemble feedback
-    # aux_models = ['tv_resnet50', 'tv_vgg16']
-    aux_models=[]
+    aux_models = ['tv_resnet50', 'tv_vgg16']
     print(f"Loading auxiliary models for ensemble: {aux_models}")
     for aux_name in aux_models:
         # Avoid duplicating the main source model if it's one of the aux models
@@ -680,10 +692,8 @@ def main_cli():
             
     print(f"Ensemble size: {len(ensemble_models)}")
 
-    all_models = model_repo.get_all_model_names()
-    target_models = model_repo.get_target_models(all_models)
-    print(f"Available models: {all_models}")
-    print(f"Selected {len(target_models)} target models for testing")
+    # target_models = model_repo.get_target_models(all_models) # 移除：避免一次性加载所有模型
+    print(f"Selected {len(all_models)} target models for testing")
 
     transform = transforms.Compose([
         transforms.Resize((299, 299)),
@@ -752,9 +762,25 @@ def main_cli():
         source_adv_preds = get_model_prediction(source_model, x_adv_batch)
 
         target_batch_preds = {}
-        for model_name, model_info in target_models.items():
-            model = model_info['model']
-            target_batch_preds[model_name] = get_model_prediction(model, x_adv_batch)
+        # 动态加载每个目标模型进行测试，测试完立即释放
+        for model_name in all_models:
+            # 如果目标模型就是源模型，直接使用已加载的 source_model
+            if model_name == args.model:
+                target_batch_preds[model_name] = get_model_prediction(source_model, x_adv_batch)
+                continue
+
+            try:
+                # 临时加载模型
+                temp_model = model_repo._load_model(model_name)
+                target_batch_preds[model_name] = get_model_prediction(temp_model, x_adv_batch)
+                
+                # 立即释放显存
+                del temp_model
+                torch.cuda.empty_cache()
+            except Exception as e:
+                print(f"Error evaluating on {model_name}: {e}")
+                # 填充失败结果
+                target_batch_preds[model_name] = np.zeros(len(x_batch)) - 1
 
         for i in range(x_batch.size(0)):
             true_label = int(y_batch[i].item()) +1
@@ -783,7 +809,7 @@ def main_cli():
         rate = source_success / len(results) * 100
         print(f"Source model attack success rate: {source_success}/{len(results)} ({rate:.1f}%)")
 
-        model_names = list(target_models.keys())
+        model_names = all_models # 使用 all_models 列表
         model_success_counts = {name: 0 for name in model_names}
         for r in results:
             for name, tr in r['target_results'].items():
