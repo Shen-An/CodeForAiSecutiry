@@ -664,7 +664,8 @@ def main_cli():
     # Prepare Ensemble
     ensemble_models = [source_model]
     # Load auxiliary models for ensemble feedback
-    aux_models = ['tv_resnet50', 'tv_vgg16']
+    # aux_models = ['tv_resnet50', 'tv_vgg16']
+    aux_models=[]
     print(f"Loading auxiliary models for ensemble: {aux_models}")
     for aux_name in aux_models:
         # Avoid duplicating the main source model if it's one of the aux models
