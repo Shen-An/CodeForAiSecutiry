@@ -655,17 +655,31 @@ def main_cli():
     device = torch.device(f"cuda:{args.GPU_ID}" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    model_repo = ModelRepository(device)
+    # 绕过 ModelRepository.__init__ 以避免一次性加载所有模型导致显存爆炸
+    # Bypass ModelRepository.__init__ to avoid loading all models at once
+    model_repo = ModelRepository.__new__(ModelRepository)
+    model_repo.device = device
+    model_repo.model_dir = 'torch_nets_weight/'
+    model_repo.models = {}
     
-    # 获取所有模型名称
-    all_models = model_repo.get_all_model_names()
+    # 手动定义支持的模型列表，因为我们跳过了 init
+    all_models = [
+        'tf2torch_inception_v3',
+        'tf2torch_inception_v4',
+        'tf2torch_resnet_v2_50',
+        'tf2torch_resnet_v2_101',
+        'tf2torch_resnet_v2_152',
+        'tf2torch_inc_res_v2',
+        'tf2torch_adv_inception_v3',
+        'tf2torch_ens3_adv_inc_v3',
+        'tf2torch_ens4_adv_inc_v3',
+        'tf2torch_ens_adv_inc_res_v2'
+    ]
+    
     print(f"Available models: {all_models}")
     
-    # 关键修改：清空 ModelRepository 中的缓存模型以释放显存
-    # 因为 ModelRepository 在初始化时加载了所有模型，导致显存爆炸 (73GB+)
-    model_repo.models.clear()
     torch.cuda.empty_cache()
-    print("Cleared ModelRepository cache to save memory.")
+    print("Initialized ModelRepository (empty).")
 
     # 使用新的加载逻辑
     try:
@@ -692,7 +706,6 @@ def main_cli():
             
     print(f"Ensemble size: {len(ensemble_models)}")
 
-    # target_models = model_repo.get_target_models(all_models) # 移除：避免一次性加载所有模型
     print(f"Selected {len(all_models)} target models for testing")
 
     transform = transforms.Compose([
