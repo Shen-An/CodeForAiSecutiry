@@ -577,7 +577,7 @@ def ldr_attack(x, y, source_models, eps=16/255, iterations=10, mu=1.0,
         x_best_trans = apply_block_transformation(x, idx_r_best, idx_c_best, block_size, k_map_best, enable_rotation)
 
     # Number of augmentations for gradient averaging (BSR style)
-    num_augmentations = 20
+    num_augmentations = 1
 
     for _ in range(iterations):
         x_adv.requires_grad_(True)
