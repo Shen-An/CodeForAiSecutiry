@@ -634,7 +634,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description='LDR Attack')
     parser.add_argument('--input_dir', default='./data', type=str, help='input directory')
     parser.add_argument('--model', default='tf2torch_inception_v3', type=str, help='source model name')
-    parser.add_argument('--batchsize', default=4, type=int, help='batch size')
+    parser.add_argument('--batchsize', default=8, type=int, help='batch size')
     parser.add_argument('--eps', default=16/255, type=float, help='epsilon for attack')
     parser.add_argument('--iterations', default=10, type=int, help='number of iterations for attack')
     parser.add_argument('--mu', default=1.0, type=float, help='momentum for attack')
