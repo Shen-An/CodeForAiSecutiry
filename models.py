@@ -2,6 +2,7 @@ import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torchvision
 import torchvision.models as models
 import torchvision.transforms as transforms
 import numpy as np
@@ -83,16 +84,16 @@ class ModelRepository:
     def _load_all_models(self):
         """Load all models into the repository following torch_attack.py style"""
         model_names = [
-            'tf2torch_inception_v3',
-            'tf2torch_inception_v4',
-            'tf2torch_resnet_v2_50',
+            # 'tf2torch_inception_v3',
+            # 'tf2torch_inception_v4',
+            # 'tf2torch_resnet_v2_50',不要
             'tf2torch_resnet_v2_101',
-            'tf2torch_resnet_v2_152',
-            'tf2torch_inc_res_v2',
-            'tf2torch_adv_inception_v3',
-            'tf2torch_ens3_adv_inc_v3',
-            'tf2torch_ens4_adv_inc_v3',
-            'tf2torch_ens_adv_inc_res_v2'
+            # 'tf2torch_resnet_v2_152',不要
+            # 'tf2torch_inc_res_v2',
+            # # 'tf2torch_adv_inception_v3',不要
+            # 'tf2torch_ens3_adv_inc_v3',
+            # 'tf2torch_ens4_adv_inc_v3',
+            # 'tf2torch_ens_adv_inc_res_v2'
         ]
 
         for model_name in model_names:
@@ -132,6 +133,24 @@ class ModelRepository:
             return self.models[model_name]
         else:
             raise ValueError(f"Model {model_name} does not exist in repository")
+
+    def load_single_model(self, model_name):
+        """
+        根据模型名称加载单个模型，并返回包含模型的字典。
+        直接调用 _load_model，它已经包含了 Normalize 层。
+        """
+        print(f"Loading {model_name}...")
+
+        # 直接获取模型，_load_model 内部已经处理了 .to(device) 和 .eval()
+        model = self._load_model(model_name)
+
+        # 保持一致性，返回字典格式
+        return {
+            'model': model,
+            'input_size': 299,
+            'type': 'both',
+            'normalization': 'tensorflow'
+        }
 
 def load_image_and_transform(img_path, transform, device):
     """Unified image loading and transformation function"""
