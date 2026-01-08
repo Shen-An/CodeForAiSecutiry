@@ -84,16 +84,16 @@ class ModelRepository:
     def _load_all_models(self):
         """Load all models into the repository following torch_attack.py style"""
         model_names = [
-            # 'tf2torch_inception_v3',
-            # 'tf2torch_inception_v4',
+             'tf2torch_inception_v3',
+             'tf2torch_inception_v4',
             # 'tf2torch_resnet_v2_50',不要
             'tf2torch_resnet_v2_101',
             # 'tf2torch_resnet_v2_152',不要
-            # 'tf2torch_inc_res_v2',
-            # # 'tf2torch_adv_inception_v3',不要
-            # 'tf2torch_ens3_adv_inc_v3',
-            # 'tf2torch_ens4_adv_inc_v3',
-            # 'tf2torch_ens_adv_inc_res_v2'
+             'tf2torch_inc_res_v2',
+             # 'tf2torch_adv_inception_v3',不要
+             'tf2torch_ens3_adv_inc_v3',
+             'tf2torch_ens4_adv_inc_v3',
+             'tf2torch_ens_adv_inc_res_v2'
         ]
 
         for model_name in model_names:

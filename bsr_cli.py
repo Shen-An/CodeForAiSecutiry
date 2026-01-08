@@ -87,7 +87,7 @@ def parse_args():
     parser.add_argument('--output_adv_dir', default='./results/dim/images', type=str, help='adv images dir')
     parser.add_argument('--output_csv', default='./results/dim/results.csv', type=str, help='output CSV path')
     parser.add_argument('--input_dir', default='./data', type=str)
-    parser.add_argument('--batchsize', default=4, type=int)
+    parser.add_argument('--batchsize', default=2, type=int)
     parser.add_argument('--eps', default=16 / 255.0, type=float)
     parser.add_argument('--iterations', default=10, type=int)
     parser.add_argument('--mu', default=1.0, type=float, help='momentum factor')
