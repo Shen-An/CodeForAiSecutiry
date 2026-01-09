@@ -233,11 +233,7 @@ def get_per_image_p_lists(pop_sigma, pop_xi, fitness_scores, K=5, blocks=0, img_
 # ==========================================
 # 3. 集成攻击逻辑 (单样本集成)
 # ==========================================
-
 def ldr_ensemble_attack(x, y, model, batch_p_lists, eps=16 / 255.0, iterations=20, mu=1.0):
-    """
-    每个样本使用其专属的 K 个矩阵进行梯度集成
-    """
     model.eval()
     B, C, H, W = x.shape
     device = x.device
@@ -251,9 +247,11 @@ def ldr_ensemble_attack(x, y, model, batch_p_lists, eps=16 / 255.0, iterations=2
         total_grad = torch.zeros_like(x_adv)
 
         for k in range(K):
+            # 获取当前置换矩阵
             R_batch = torch.stack([batch_p_lists[b][k][0] for b in range(B)]).to(device)
             C_batch = torch.stack([batch_p_lists[b][k][1] for b in range(B)]).to(device)
 
+            # 1. 对带扰动的 x_adv 进行置换进行前向传播
             x_permuted = torch.matmul(R_batch.unsqueeze(1), x_adv)
             x_permuted = torch.matmul(x_permuted, C_batch.unsqueeze(1))
 
@@ -263,7 +261,17 @@ def ldr_ensemble_attack(x, y, model, batch_p_lists, eps=16 / 255.0, iterations=2
             model.zero_grad()
             loss.backward()
 
+            # 2. 获取置换空间下的梯度
+            # 注意：x_adv.grad 此时已经是相对于 x_adv 原始坐标系的梯度了
+            # 因为 PyTorch 的自动微分会自动处理线性变换的链式法则
             grad = x_adv.grad.data
+
+            # --- 关键说明 ---
+            # 实际上，在 PyTorch 中，如果你对 x_adv 做了 x_p = R * x_adv * C 这种线性变换，
+            # loss.backward() 计算出的 x_adv.grad 已经自动包含了“逆变换”的过程。
+            # 所以手动做 R^T * grad * C^T 只有在你直接对“变换后的图像”求导时才需要。
+
+            # 3. 梯度归一化并累加
             grad = grad / (torch.mean(torch.abs(grad), dim=(1, 2, 3), keepdim=True) + 1e-8)
             total_grad += grad
             x_adv.grad.zero_()
@@ -276,7 +284,6 @@ def ldr_ensemble_attack(x, y, model, batch_p_lists, eps=16 / 255.0, iterations=2
         x_adv = torch.clamp(x + delta, 0, 1)
 
     return x_adv.detach()
-
 
 def parse_args():
     parser = argparse.ArgumentParser(description="LDR Batch-level Attack")
