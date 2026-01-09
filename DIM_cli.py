@@ -313,7 +313,7 @@ def main():
             true_label = int(y_batch[i].item()) + 1
             s_adv_idx = int(source_adv_preds[i]) + 1
             s_orig_idx = int(source_orig_preds[i]) + 1
-            print(f"{s_orig_idx}\t{s_adv_idx}\t{true_label}")
+            # print(f"{s_orig_idx}\t{s_adv_idx}\t{true_label}")
             source_results.append({
                 "filename": filename_batch[i],
                 "true_label": true_label,

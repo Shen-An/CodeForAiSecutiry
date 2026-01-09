@@ -1,102 +1,103 @@
 import argparse
 import gc
 import os
-import numpy as np
 import pandas as pd
 import torch
 import torch.nn.functional as F
-
+import torchvision.models
 from torchvision.utils import save_image
 from tqdm import tqdm
 from torchvision import transforms
-from models import ModelRepository
-from torch.utils.data import DataLoader,  TensorDataset
-import math
+from models import ModelRepository, Normalize
+from torch.utils.data import DataLoader, TensorDataset
+
+from preprocess import AdvPNGDataset, get_model_prediction
 
 
-from preprocess import AdvPNGDataset, get_model_output, load_source_model, get_model_prediction
-
-
-def attack(x, y, model, eps=16 / 255, iterations=10, mu=1.0):
+def mi_fgsm_attack(x, y, model, eps=16 / 255.0, iterations=20, mu=1.0, **kwargs):
     """
-    纯净的SI-MI-FGSM攻击：只包含缩放不变性和动量迭代
-
-    Args:
-        x: 原始图像 [1, 3, H, W]
-        y: 真实标签
-        model: 目标模型
-        eps: 最大扰动
-        iterations: 迭代次数
-        mu: 动量系数
-    Returns:
-        x_adv: 对抗样本
+    MI-FGSM 攻击 (Momentum Iterative FGSM)
+    目标：仅通过带动量的分类损失梯度进行攻击
     """
+    model.eval()
     device = x.device
-    x_adv = x.clone().detach().requires_grad_(True)
 
-    # 计算迭代步长
-    alpha = eps / iterations
-
-    # 初始化动量
-    momentum = torch.zeros_like(x).to(device)
+    # 1. 初始化
+    x_adv = x.clone().detach()
+    momentum = torch.zeros_like(x_adv)
+    alpha_step = eps / iterations
 
     for i in range(iterations):
         x_adv.requires_grad = True
 
-        # 缩放不变性：在不同缩放尺度上计算梯度
-        grad = torch.zeros_like(x).to(device)
-        scales = [1.0, 1 / 2, 1 / 4, 1 / 8, 1 / 16]
+        # 2. 前向传播计算交叉熵损失
+        output = model(x_adv)
+        if isinstance(output, (tuple, list)):
+            output = output[0]
 
-        for scale in scales:
-            # 缩放输入
-            x_scaled = x_adv * scale
+        loss = F.cross_entropy(output, y)
 
-            # 获取模型输出
-            output = get_model_output(model, x_scaled)
+        # 3. 反向传播获取梯度
+        model.zero_grad()
+        loss.backward()
 
-            # 处理输出形状以确保可以计算交叉熵损失
-            if output.dim() == 1:
-                # 如果是一维输出，添加batch维度
-                output = output.unsqueeze(0)
-            elif output.dim() > 2:
-                # 如果是更高维度的输出，展平为二维
-                output = output.view(output.size(0), -1)
+        grad = x_adv.grad.data
 
-            # 计算损失
-            loss = F.cross_entropy(output, y)
+        # 4. 梯度的 L1 归一化 (MI-FGSM 标准操作)
+        # 将当前步梯度除以其平均绝对值，使梯度在同一量级
+        grad = grad / (torch.mean(torch.abs(grad), dim=(1, 2, 3), keepdim=True) + 1e-8)
 
-            # 计算梯度并累加
-            grad_scale = torch.autograd.grad(loss, [x_adv])[0]
-            grad += grad_scale
-
-        # 归一化梯度（根据SI-MI-FGSM原文）
-        grad = grad / torch.mean(torch.abs(grad), dim=(1, 2, 3), keepdim=True)
-
-        # 动量更新
+        # 5. 动量累积：g_{t+1} = mu * g_t + grad_t
         momentum = mu * momentum + grad
 
-        # 更新对抗样本
-        x_adv = x_adv.detach() + alpha * torch.sign(momentum)
+        # 6. 符号更新：x_{t+1} = x_t + alpha * sign(momentum)
+        x_adv = x_adv.detach() + alpha_step * torch.sign(momentum)
 
-        # 裁剪到允许范围内
+        # 7. 投影约束 (Clip)
         delta = torch.clamp(x_adv - x, min=-eps, max=eps)
         x_adv = torch.clamp(x + delta, 0, 1)
 
     return x_adv.detach()
 
 
+
+
 def parse_args():
-    parser = argparse.ArgumentParser(description="BSR attack")
+    parser = argparse.ArgumentParser(description="mi-fgsm attack")
     parser.add_argument("--model", default='inception_v3', type=str, help="source model")
-    parser.add_argument('--output_adv_dir', default='./results/SIM/images', type=str, help='adv images dir')
-    parser.add_argument('--output_csv', default='./results/SIM/results.csv', type=str, help='output CSV path')
+    parser.add_argument('--output_adv_dir', default='./results/mi-fgsm/images', type=str, help='adv images dir')
+    parser.add_argument('--output_csv', default='./results/mi-fgsm/results.csv', type=str, help='output CSV path')
     parser.add_argument('--input_dir', default='./data', type=str)
-    parser.add_argument('--batchsize', default=4, type=int)
+    parser.add_argument('--batchsize', default=8, type=int)
     parser.add_argument('--eps', default=16 / 255.0, type=float)
     parser.add_argument('--iterations', default=10, type=int)
     parser.add_argument('--mu', default=1.0, type=float, help='momentum factor')
 
     return parser.parse_args()
+
+
+def load_source_model(model_name, device):
+    if model_name == 'inception_v3':
+        net = torchvision.models.inception_v3(pretrained=True)
+    elif model_name == 'resnet50':
+        net = torchvision.models.resnet50(pretrained=True)
+    elif model_name == 'vgg16':
+        net = torchvision.models.vgg16(pretrained=True)
+    elif model_name == 'densenet121':
+        net = torchvision.models.densenet121(pretrained=True)
+    elif model_name == 'resnet101':
+        net = torchvision.models.resnet101(pretrained=True)
+    else:
+        raise Exception("Invalid model name" + model_name);
+
+    net = net.to(device);
+    net.eval();
+    mean = [0.485, 0.456, 0.406]
+    std = [0.229, 0.224, 0.225]
+
+    model = torch.nn.Sequential(Normalize(mean=mean, std=std), net);
+    return model;
+
 
 def main():
     args = parse_args()
@@ -137,7 +138,7 @@ def main():
         source_orig_preds = get_model_prediction(source_model, x_batch)
 
         # 生成对抗样本
-        x_adv_batch = attack(x_batch, y_batch, source_model,
+        x_adv_batch = mi_fgsm_attack(x_batch, y_batch, source_model,
                                  eps=args.eps, iterations=args.iterations,
                                  mu=args.mu)
 

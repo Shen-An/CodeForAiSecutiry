@@ -13,90 +13,100 @@ from models import ModelRepository
 from torch.utils.data import DataLoader,  TensorDataset
 import math
 
-
 from preprocess import AdvPNGDataset, get_model_output, load_source_model, get_model_prediction
 
 
-def attack(x, y, model, eps=16 / 255, iterations=10, mu=1.0):
+
+def get_admix_grad(x_adv, y, model, num_scale=5, num_admix=3, eta=0.2):
     """
-    纯净的SI-MI-FGSM攻击：只包含缩放不变性和动量迭代
+    实现公式：g_bar = (1/(m1*m2)) * sum(x' in X') * sum(i=0 to m1-1) Grad(...)
 
-    Args:
-        x: 原始图像 [1, 3, H, W]
-        y: 真实标签
-        model: 目标模型
-        eps: 最大扰动
-        iterations: 迭代次数
-        mu: 动量系数
-    Returns:
-        x_adv: 对抗样本
+    :param x_adv: 当前迭代的对抗样本 (x_t^adv)
+    :param y: 真实标签
+    :param model: 代理模型 (theta)
+    :param num_scale: 对应公式中的 m1 (缩放副本数量)
+    :param num_admix: 对应公式中的 m2 (随机采样图像数量)
+    :param eta: 混合强度 (eta)
     """
-    device = x.device
-    x_adv = x.clone().detach().requires_grad_(True)
+    grad_sum = 0
 
-    # 计算迭代步长
-    alpha = eps / iterations
+    # 1. 对应公式中的 \sum_{x' \in X'} (外层循环 m2 次)
+    # 我们通过随机打乱当前 batch 来模拟从“其他类别随机采样”
+    for _ in range(num_admix):
+        x_rand = x_adv[torch.randperm(x_adv.size(0))].detach()
 
-    # 初始化动量
-    momentum = torch.zeros_like(x).to(device)
+        # 2. 对应公式中的 (x_t^adv + eta * x')
+        # 先把随机图混进去，得到 Admix 后的底图
+        x_mixed = x_adv + eta * x_rand
+
+        # 3. 对应公式中的 \sum_{i=0}^{m1-1} (内层循环 m1 次)
+        for s in range(num_scale):
+            # 对应公式中的 gamma_i * (...)
+            # 这里 gamma_i 取标准值 1/(2**s)
+            x_input = x_mixed / (2 ** s)
+
+            # 4. 对应公式中的 \nabla J(...)
+            output = model(x_input)
+            if isinstance(output, (tuple, list)):
+                output = output[0]
+            loss = F.cross_entropy(output, y)
+
+            # 计算相对于原始 x_adv 的梯度并累加
+            grad_sum += torch.autograd.grad(loss, x_adv)[0]
+
+    # 5. 对应公式最前面的 1/(m1 * m2)
+    return grad_sum / (num_scale * num_admix)
+
+
+def admix_SI_mi_fgsm_attack(x, y, model, eps=16 / 255.0, iterations=16, mu=1.0,
+
+                         num_scale=5, num_admix=3, eta=0.2):
+    model.eval()
+    x_adv = x.clone().detach()
+    momentum = torch.zeros_like(x_adv)
+    alpha_step = eps / iterations
 
     for i in range(iterations):
         x_adv.requires_grad = True
 
-        # 缩放不变性：在不同缩放尺度上计算梯度
-        grad = torch.zeros_like(x).to(device)
-        scales = [1.0, 1 / 2, 1 / 4, 1 / 8, 1 / 16]
+        # --- 改动点 ---
+        # 不再使用简单的 loss.backward()
+        # 而是调用上面写好的 Admix 梯度计算函数
+        grad = get_admix_grad(x_adv, y, model, num_scale, num_admix, eta)
+        # -----------------------
 
-        for scale in scales:
-            # 缩放输入
-            x_scaled = x_adv * scale
+        # 4. 梯度的 L1 归一化
+        grad = grad / (torch.mean(torch.abs(grad), dim=(1, 2, 3), keepdim=True) + 1e-8)
 
-            # 获取模型输出
-            output = get_model_output(model, x_scaled)
-
-            # 处理输出形状以确保可以计算交叉熵损失
-            if output.dim() == 1:
-                # 如果是一维输出，添加batch维度
-                output = output.unsqueeze(0)
-            elif output.dim() > 2:
-                # 如果是更高维度的输出，展平为二维
-                output = output.view(output.size(0), -1)
-
-            # 计算损失
-            loss = F.cross_entropy(output, y)
-
-            # 计算梯度并累加
-            grad_scale = torch.autograd.grad(loss, [x_adv])[0]
-            grad += grad_scale
-
-        # 归一化梯度（根据SI-MI-FGSM原文）
-        grad = grad / torch.mean(torch.abs(grad), dim=(1, 2, 3), keepdim=True)
-
-        # 动量更新
+        # 5. 动量累积
         momentum = mu * momentum + grad
 
-        # 更新对抗样本
-        x_adv = x_adv.detach() + alpha * torch.sign(momentum)
+        # 6. 更新步进
+        x_adv = x_adv.detach() + alpha_step * torch.sign(momentum)
 
-        # 裁剪到允许范围内
+        # 7. 投影约束
         delta = torch.clamp(x_adv - x, min=-eps, max=eps)
         x_adv = torch.clamp(x + delta, 0, 1)
 
     return x_adv.detach()
 
-
 def parse_args():
     parser = argparse.ArgumentParser(description="BSR attack")
     parser.add_argument("--model", default='inception_v3', type=str, help="source model")
-    parser.add_argument('--output_adv_dir', default='./results/SIM/images', type=str, help='adv images dir')
-    parser.add_argument('--output_csv', default='./results/SIM/results.csv', type=str, help='output CSV path')
+    parser.add_argument('--output_adv_dir', default='./results/BSR/images', type=str, help='adv images dir')
+    parser.add_argument('--output_csv', default='./results/BSR/results.csv', type=str, help='output CSV path')
     parser.add_argument('--input_dir', default='./data', type=str)
-    parser.add_argument('--batchsize', default=4, type=int)
+    parser.add_argument('--batchsize', default=16, type=int)
     parser.add_argument('--eps', default=16 / 255.0, type=float)
-    parser.add_argument('--iterations', default=10, type=int)
+    parser.add_argument('--iterations', default=16, type=int)
     parser.add_argument('--mu', default=1.0, type=float, help='momentum factor')
+    parser.add_argument('--diversity_prob', default=0.5, type=float, help='input diversity probability')
+
+    parser.add_argument("--num_scale",default=5,type=int,help="m1 (缩放副本数量)")
+    parser.add_argument("--num_admix",default=3,type=int,help="m2 (随机采样图像数量)")
 
     return parser.parse_args()
+
 
 def main():
     args = parse_args()
@@ -137,9 +147,9 @@ def main():
         source_orig_preds = get_model_prediction(source_model, x_batch)
 
         # 生成对抗样本
-        x_adv_batch = attack(x_batch, y_batch, source_model,
+        x_adv_batch = admix_SI_mi_fgsm_attack(x_batch, y_batch, source_model,
                                  eps=args.eps, iterations=args.iterations,
-                                 mu=args.mu)
+                                 mu=args.mu, num_scale=args.num_scale,num_admix = args.num_admix)
 
         # 记录攻击后预测
         source_adv_preds = get_model_prediction(source_model, x_adv_batch)
