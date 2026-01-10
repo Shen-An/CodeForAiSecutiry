@@ -104,8 +104,8 @@ def parse_args():
     parser.add_argument("--num_blocks_h",default=2,type=int,help="number of blocks h")
     parser.add_argument("--num_blocks_w",default=2,type=int,help="number of blocks w")
     parser.add_argument("--max_angle",default=2,type=int,help="maximum angle")
-    parser.add_argument("--num_samples",default=10,type=int,help="population size (M)")
-    parser.add_argument("--num_keep",default=5,type=int,help="elite size (K)")
+    parser.add_argument("--num_samples",default=40,type=int,help="population size (M)")
+    parser.add_argument("--num_keep",default=20,type=int,help="elite size (K)")
     parser.add_argument("--beta", default=0.1, type=float, help="mutation scale")
     return parser.parse_args()
 
@@ -236,20 +236,18 @@ def mutate_bsr_params(params, num_blocks_h, num_blocks_w, max_angle, beta, devic
         
     return new_params
 
-def mifgsm_attack_EATA(x, y, model, eps=16 / 255, iterations=10, mu=1.0,
-                       num_blocks_h=2, num_blocks_w=2, max_angle=0.2,
-                       num_samples=10, num_keep=5, diversity_prob=0.5, beta=0.1):
+def eata_single_attack(x, y, model, eps, iterations, mu,
+                       num_blocks_h, num_blocks_w, max_angle,
+                       num_samples, num_keep, diversity_prob, beta):
     """
-    EATA: 结合演化筛选与梯度对齐的攻击
-    num_samples: 每一轮生成的随机变换种子总数 (演化池 M)
-    num_keep: 最终用于梯度对齐的最优变换数 (精英种群 K)
+    针对单张图片的EATA攻击逻辑，确保评估和演化的独立性。
     """
     alpha = eps / iterations
     x_adv = x.clone().requires_grad_(True)
     momentum = torch.zeros_like(x).to(x.device)
 
-    for i in range(iterations):
-        # 1. 演化筛选阶段 (仅推理，不计算梯度)
+    for t in range(iterations):
+        # 1. 演化筛选阶段 (Evolutionary Search)
         model.eval()
         
         # A. 采样与评估 (Initialize Population)
@@ -257,34 +255,27 @@ def mifgsm_attack_EATA(x, y, model, eps=16 / 255, iterations=10, mu=1.0,
         current_losses = []
         
         with torch.no_grad():
-            # 生成初始种群 M (或者上一代的继承? EATA通常每步重新生成或部分继承，这里按每步重新生成简化)
             for _ in range(num_samples):
-                p = generate_bsr_params(x.size(0), num_blocks_h, num_blocks_w, max_angle, x.device, x.size(2), x.size(3))
+                # 生成单张图片的变换参数 (batch_size=1)
+                p = generate_bsr_params(1, num_blocks_h, num_blocks_w, max_angle, x.device, x.size(2), x.size(3))
+                # 应用变换 (包含Input Diversity)
                 x_tmp = apply_bsr_with_params(input_diversity(x_adv, prob=diversity_prob), p, num_blocks_h, num_blocks_w)
-                loss_val = F.cross_entropy(model(x_tmp), y, reduction='none') # 保持batch维度以便后续筛选?
-                # 简化：这里假设batch_size=1或者针对整个batch统一评估。
-                # 原始代码使用了 F.cross_entropy(..., y) 默认 mean reduction, 导致无法区分batch内个体的变换效果。
-                # 但 generate_bsr_params 是针对 batch 的 angles，perm 是共享的
-                # 为了简单起见，且遵循原始代码结构，我们假设 param 是针对整个 Image Batch 共享的结构参数
-                # (注意: generate_bsr_params生成一个 scalar 的 angles 列表? 不, angles是 (batch_size))
-                # 仔细看 generate_bsr_params: angles shape is (batch_size). 
-                # 所以一组 param 实际上定义了整个 batch 的变换。
+                # 计算损失 (Single Scalar)
+                # EATA.md: L_m = J(f(T(x)), y)
+                loss_val = F.cross_entropy(model(x_tmp), y)
                 
-                loss_scalar = loss_val.mean().item()
                 current_params.append(p)
-                current_losses.append(loss_scalar)
+                current_losses.append(loss_val.item())
             
             # B. 演化更新 (Evolutionary Update)
-            # 选取 Top K 精英
             current_losses_np = np.array(current_losses)
+            # 选取 Top K 精英 (Loss越大越好)
             best_indices = np.argsort(current_losses_np)[-num_keep:]
             elite_params = [current_params[idx] for idx in best_indices]
             
-            # 变异产生新后代补充到 M
-            # 实际上 EATA 论文中是: 选 K 个 -> 变异产生 M-K 个 -> 合并 -> 再选 K 个
+            # 变异产生新后代补充到 M (Mutate to replace M-K)
             mutated_params = []
             for _ in range(num_samples - num_keep):
-                # 随机选一个精英进行变异
                 parent = elite_params[np.random.randint(len(elite_params))]
                 child = mutate_bsr_params(parent, num_blocks_h, num_blocks_w, max_angle, beta, x.device)
                 mutated_params.append(child)
@@ -300,16 +291,15 @@ def mifgsm_attack_EATA(x, y, model, eps=16 / 255, iterations=10, mu=1.0,
             total_params = elite_params + mutated_params
             total_losses = current_losses_np[best_indices].tolist() + mutated_losses
             
-            # 再次选取 Top K (最终精英)
+            # 再次选取 Top K (最终优胜变换集)
             final_indices = np.argsort(total_losses)[-num_keep:]
             final_elite_params = [total_params[idx] for idx in final_indices]
 
-        # 2. 梯度对齐阶段
+        # 2. 梯度对齐阶段 (Gradient Alignment)
         model.zero_grad()
         grads = []
         
         for p in final_elite_params:
-            # Fix: detach() to make it a leaf tensor so .grad is populated
             x_input = x_adv.clone().detach().requires_grad_(True)
             x_transformed = apply_bsr_with_params(input_diversity(x_input, prob=diversity_prob), p, num_blocks_h, num_blocks_w)
             output = model(x_transformed)
@@ -318,9 +308,8 @@ def mifgsm_attack_EATA(x, y, model, eps=16 / 255, iterations=10, mu=1.0,
             
             grads.append(x_input.grad.data)
             
-        # 计算对齐权重 (Softmax)
-        if i > 0 and len(grads) > 0:
-            # 计算与动量的余弦相似度
+        # 计算对齐权重 (Softmax based on Cosine Similarity with Momentum)
+        if t > 0 and len(grads) > 0:
             cos_sims = []
             flat_momentum = momentum.view(1, -1)
             for g in grads:
@@ -328,7 +317,6 @@ def mifgsm_attack_EATA(x, y, model, eps=16 / 255, iterations=10, mu=1.0,
                 sim = F.cosine_similarity(flat_g, flat_momentum).item()
                 cos_sims.append(sim)
             
-            # Softmax 权重
             cos_sims = torch.tensor(cos_sims, device=x.device)
             weights = F.softmax(cos_sims, dim=0)
         else:
@@ -340,7 +328,6 @@ def mifgsm_attack_EATA(x, y, model, eps=16 / 255, iterations=10, mu=1.0,
             combined_grad += weights[idx] * g
         
         # 3. 动量更新与对抗样本生成
-        # 归一化 L1 [cite: 3, 100]
         grad_norm = torch.mean(torch.abs(combined_grad), dim=(1, 2, 3), keepdim=True) + 1e-8
         momentum = mu * momentum + (combined_grad / grad_norm)
 
@@ -352,6 +339,25 @@ def mifgsm_attack_EATA(x, y, model, eps=16 / 255, iterations=10, mu=1.0,
         x_adv = x_adv.detach().requires_grad_(True)
 
     return x_adv
+
+def mifgsm_attack_EATA(x, y, model, eps=16 / 255, iterations=10, mu=1.0,
+                       num_blocks_h=2, num_blocks_w=2, max_angle=0.2,
+                       num_samples=10, num_keep=5, diversity_prob=0.5, beta=0.1):
+    """
+    EATA Wrapper: 对Batch中的每一张图片独立执行EATA攻击
+    """
+    adv_images = []
+    # 遍历Batch中的每一张图片，确保完全独立的评估环境
+    for i in range(x.size(0)):
+        x_single = x[i:i+1]
+        y_single = y[i:i+1]
+        
+        x_adv_single = eata_single_attack(x_single, y_single, model, eps, iterations, mu,
+                                          num_blocks_h, num_blocks_w, max_angle,
+                                          num_samples, num_keep, diversity_prob, beta)
+        adv_images.append(x_adv_single)
+        
+    return torch.cat(adv_images, dim=0)
 
 
 def main():
