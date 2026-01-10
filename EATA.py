@@ -15,19 +15,25 @@ import math
 
 from preprocess import AdvPNGDataset, get_model_output, load_source_model, get_model_prediction
 
-def generate_bsr_params(batch_size, num_blocks_h, num_blocks_w, max_angle, device):
-    """生成一组BSR参数组合"""
+def generate_bsr_params(batch_size, num_blocks_h, num_blocks_w, max_angle, device, width, height):
+    """生成一组BSR参数组合, 包括随机分块长度、置换和旋转角度"""
     return {
         'w_perm': np.random.permutation(np.arange(num_blocks_h)),
         'h_perm': np.random.permutation(np.arange(num_blocks_w)),
-        'angles': torch.clamp(torch.randn(batch_size, device=device) * 0.05, -max_angle, max_angle)
+        # 每个块独立的旋转角度 (Batch, H_blocks, W_blocks)
+        'angles': torch.clamp(torch.randn(batch_size, num_blocks_h, num_blocks_w, device=device) * 0.05, -max_angle, max_angle),
+        # 固定的分块长度，保证评估和梯度的变换一致性
+        'width_length': get_block_lengths_bsr(width, num_blocks_h),
+        'height_length': get_block_lengths_bsr(height, num_blocks_w)
     }
 
 def apply_bsr_with_params(x, params, num_blocks_h, num_blocks_w):
     """使用预设参数应用BSR变换"""
     batch_size, channels, w, h = x.shape
-    width_length = get_block_lengths_bsr(w, num_blocks_h)
-    height_length = get_block_lengths_bsr(h, num_blocks_w)
+    
+    # 使用参数中固定的分块长度 (如果存在)，否则重新生成 (兼容旧逻辑)
+    width_length = params.get('width_length', get_block_lengths_bsr(w, num_blocks_h))
+    height_length = params.get('height_length', get_block_lengths_bsr(h, num_blocks_w))
 
     # 应用宽度打乱
     x_split_w = torch.split(x, width_length, dim=2)
@@ -41,11 +47,32 @@ def apply_bsr_with_params(x, params, num_blocks_h, num_blocks_w):
         rotated_strip = []
         for h_idx in range(num_blocks_w):
             block = h_blocks[h_idx]
-            # 使用传入的角度参数
-            angle = params['angles']
             
-            # ... 旋转逻辑 (代码同你之前的 shuffle_rotate_bsr) ...
-            # 此处省略具体旋转代码，只需确保使用 params['angles']
+            # 获取当前块的角度
+            # params['angles'] 可能是 (B,) 或 (B, H, W)
+            angles_param = params['angles']
+            if len(angles_param.shape) == 3:
+                # EATA standard: independent angle per block
+                current_angles = angles_param[:, w_idx, h_idx]
+            else:
+                 # Fallback: shared angle
+                current_angles = angles_param
+
+            # 旋转逻辑
+            rotated_block = block.clone()
+            for i in range(batch_size):
+                if block.shape[2] > 1 and block.shape[3] > 1: # 确保块足够大
+                    angle = current_angles[i]
+                    angle_matrix = torch.tensor([
+                        [math.cos(angle), -math.sin(angle), 0],
+                        [math.sin(angle), math.cos(angle), 0]
+                    ], dtype=torch.float32, device=x.device).unsqueeze(0)
+                    
+                    grid = F.affine_grid(angle_matrix, block[i:i + 1].size(), align_corners=False)
+                    rotated_block[i:i + 1] = F.grid_sample(block[i:i + 1], grid, mode='bilinear',
+                                                           padding_mode='zeros', align_corners=False)
+            
+            rotated_strip.append(rotated_block)
             
         # 使用传入的 h_perm
         rotated_strip_perm = [rotated_strip[i] for i in params['h_perm']]
@@ -53,6 +80,7 @@ def apply_bsr_with_params(x, params, num_blocks_h, num_blocks_w):
     
     # 使用传入的 w_perm
     return torch.cat([rotated_blocks[i] for i in params['w_perm']], dim=2)
+
 def get_block_lengths_bsr(length, num_blocks):
     """BSR版本的分块长度计算"""
     length = int(length)
@@ -192,14 +220,21 @@ def mutate_bsr_params(params, num_blocks_h, num_blocks_w, max_angle, beta, devic
         new_perm = perm.copy()
         if n > 1:
             idx1, idx2 = np.random.choice(n, 2, replace=False)
-            new_perm[idx1], idx2 = new_perm[idx2], new_perm[idx1]
+            new_perm[idx1], new_perm[idx2] = new_perm[idx2], new_perm[idx1]
         return new_perm
 
-    return {
+    new_params = {
         'w_perm': mutate_perm(params['w_perm'], num_blocks_h),
         'h_perm': mutate_perm(params['h_perm'], num_blocks_w),
         'angles': new_angles
     }
+    # 继承分块长度 (不做变异，保持一致性)
+    if 'width_length' in params:
+        new_params['width_length'] = params['width_length']
+    if 'height_length' in params:
+        new_params['height_length'] = params['height_length']
+        
+    return new_params
 
 def mifgsm_attack_EATA(x, y, model, eps=16 / 255, iterations=10, mu=1.0,
                        num_blocks_h=2, num_blocks_w=2, max_angle=0.2,
@@ -224,7 +259,7 @@ def mifgsm_attack_EATA(x, y, model, eps=16 / 255, iterations=10, mu=1.0,
         with torch.no_grad():
             # 生成初始种群 M (或者上一代的继承? EATA通常每步重新生成或部分继承，这里按每步重新生成简化)
             for _ in range(num_samples):
-                p = generate_bsr_params(x.size(0), num_blocks_h, num_blocks_w, max_angle, x.device)
+                p = generate_bsr_params(x.size(0), num_blocks_h, num_blocks_w, max_angle, x.device, x.size(2), x.size(3))
                 x_tmp = apply_bsr_with_params(input_diversity(x_adv, prob=diversity_prob), p, num_blocks_h, num_blocks_w)
                 loss_val = F.cross_entropy(model(x_tmp), y, reduction='none') # 保持batch维度以便后续筛选?
                 # 简化：这里假设batch_size=1或者针对整个batch统一评估。
