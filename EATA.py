@@ -96,7 +96,7 @@ def parse_args():
     parser.add_argument('--output_adv_dir', default='./results/EATA/images', type=str, help='adv images dir')
     parser.add_argument('--output_csv', default='./results/EATA/results.csv', type=str, help='output CSV path')
     parser.add_argument('--input_dir', default='./data', type=str)
-    parser.add_argument('--batchsize', default=2, type=int)
+    parser.add_argument('--batchsize', default=4, type=int)
     parser.add_argument('--eps', default=16 / 255.0, type=float)
     parser.add_argument('--iterations', default=10, type=int)
     parser.add_argument('--mu', default=1.0, type=float, help='momentum factor')
@@ -276,7 +276,8 @@ def mifgsm_attack_EATA(x, y, model, eps=16 / 255, iterations=10, mu=1.0,
             
             # B. 演化更新 (Evolutionary Update)
             # 选取 Top K 精英
-            best_indices = np.argsort(current_losses)[-num_keep:]
+            current_losses_np = np.array(current_losses)
+            best_indices = np.argsort(current_losses_np)[-num_keep:]
             elite_params = [current_params[idx] for idx in best_indices]
             
             # 变异产生新后代补充到 M
@@ -297,7 +298,7 @@ def mifgsm_attack_EATA(x, y, model, eps=16 / 255, iterations=10, mu=1.0,
             
             # 合并种群 (精英 + 变异)
             total_params = elite_params + mutated_params
-            total_losses = [current_losses[idx] for idx in best_indices] + mutated_losses
+            total_losses = current_losses_np[best_indices].tolist() + mutated_losses
             
             # 再次选取 Top K (最终精英)
             final_indices = np.argsort(total_losses)[-num_keep:]
@@ -308,7 +309,8 @@ def mifgsm_attack_EATA(x, y, model, eps=16 / 255, iterations=10, mu=1.0,
         grads = []
         
         for p in final_elite_params:
-            x_input = x_adv.clone().requires_grad_(True)
+            # Fix: detach() to make it a leaf tensor so .grad is populated
+            x_input = x_adv.clone().detach().requires_grad_(True)
             x_transformed = apply_bsr_with_params(input_diversity(x_input, prob=diversity_prob), p, num_blocks_h, num_blocks_w)
             output = model(x_transformed)
             loss = F.cross_entropy(output, y)
@@ -412,7 +414,7 @@ def main():
             true_label = int(y_batch[i].item()) + 1
             s_adv_idx = int(source_adv_preds[i]) + 1
             s_orig_idx = int(source_orig_preds[i]) + 1
-            # print(f"{s_orig_idx}\t{s_adv_idx}\t{true_label}")
+            print(f"{s_orig_idx}\t{s_adv_idx}\t{true_label}")
             source_results.append({
                 "filename": filename_batch[i],
                 "true_label": true_label,
