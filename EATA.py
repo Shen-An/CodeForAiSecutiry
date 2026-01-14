@@ -69,57 +69,49 @@ def generate_bsr_params(batch_size, num_blocks_h, num_blocks_w, max_angle, devic
     }
 
 def apply_bsr_with_params(x, params, num_blocks_h, num_blocks_w):
-    """使用预设参数应用BSR变换"""
+    """使用预设参数应用BSR变换 (batch 版 grid_sample 优化)"""
     batch_size, channels, w, h = x.shape
-    
-    # 使用参数中固定的分块长度 (如果存在)，否则重新生成 (兼容旧逻辑)
+
     width_length = params.get('width_length', get_block_lengths_bsr(w, num_blocks_h))
     height_length = params.get('height_length', get_block_lengths_bsr(h, num_blocks_w))
 
-    # 应用宽度打乱
     x_split_w = torch.split(x, width_length, dim=2)
-    
-    # 按照记录的参数重组
+
     rotated_blocks = []
     for w_idx in range(num_blocks_h):
         w_block = x_split_w[w_idx]
         h_blocks = torch.split(w_block, height_length, dim=3)
-        
+
         rotated_strip = []
         for h_idx in range(num_blocks_w):
             block = h_blocks[h_idx]
-            
-            # 获取当前块的角度
-            # params['angles'] 可能是 (B,) 或 (B, H, W)
+
             angles_param = params['angles']
             if len(angles_param.shape) == 3:
-                # EATA standard: independent angle per block
                 current_angles = angles_param[:, w_idx, h_idx]
             else:
-                 # Fallback: shared angle
                 current_angles = angles_param
 
-            # 旋转逻辑
-            rotated_block = block.clone()
-            for i in range(batch_size):
-                if block.shape[2] > 1 and block.shape[3] > 1: # 确保块足够大
-                    angle = current_angles[i]
-                    angle_matrix = torch.tensor([
-                        [math.cos(angle), -math.sin(angle), 0],
-                        [math.sin(angle), math.cos(angle), 0]
-                    ], dtype=torch.float32, device=x.device).unsqueeze(0)
-                    
-                    grid = F.affine_grid(angle_matrix, block[i:i + 1].size(), align_corners=False)
-                    rotated_block[i:i + 1] = F.grid_sample(block[i:i + 1], grid, mode='bilinear',
-                                                           padding_mode='zeros', align_corners=False)
-            
+            # batch-wise rotation via affine_grid + grid_sample
+            if block.shape[2] > 1 and block.shape[3] > 1:
+                cos_a = torch.cos(current_angles).to(block.dtype)
+                sin_a = torch.sin(current_angles).to(block.dtype)
+                theta = torch.zeros((batch_size, 2, 3), device=block.device, dtype=block.dtype)
+                theta[:, 0, 0] = cos_a
+                theta[:, 0, 1] = -sin_a
+                theta[:, 1, 0] = sin_a
+                theta[:, 1, 1] = cos_a
+
+                grid = F.affine_grid(theta, block.size(), align_corners=False)
+                rotated_block = F.grid_sample(block, grid, mode='bilinear', padding_mode='zeros', align_corners=False)
+            else:
+                rotated_block = block
+
             rotated_strip.append(rotated_block)
-            
-        # 使用传入的 h_perm
+
         rotated_strip_perm = [rotated_strip[i] for i in params['h_perm']]
         rotated_blocks.append(torch.cat(rotated_strip_perm, dim=3))
-    
-    # 使用传入的 w_perm
+
     return torch.cat([rotated_blocks[i] for i in params['w_perm']], dim=2)
 
 def get_block_lengths_bsr(length, num_blocks):
@@ -291,99 +283,126 @@ def mutate_bsr_params(params, num_blocks_h, num_blocks_w, max_angle, beta, devic
 
 def eata_single_attack(x, y, models, eps, iterations, mu,
                        num_blocks_h, num_blocks_w, max_angle,
-                       num_samples, num_keep, diversity_prob, beta):
+                       num_samples, num_keep, diversity_prob, beta,
+                       admix_gamma=1.0, admix_eta=0.2):
     """
-    针对单张图片的EATA攻击逻辑 (集成演化版本)。
-    models: list of models (Ensemble)
+    Batch 版 EATA 攻击。
+
+    关键点:
+    - 演化阶段：对每个 sample 参数计算 batch 内每张图的 loss，得到 shape=(num_samples,batch) 的 loss 矩阵；
+      使用 topk(dim=0) 为 batch 中每张图独立选择 num_keep 精英。
+    - 梯度阶段：对每个精英参数，使用 Admix: J(gamma * (x_adv + eta*x_rand))，x_rand 为 batch shuffle；
+      对累积 batch loss 取平均并计算梯度，然后对精英梯度再平均。
     """
     alpha = eps / iterations
-    x_adv = x.clone().requires_grad_(True)
-    momentum = torch.zeros_like(x).to(x.device)
+    x_adv = x.clone().detach()
+    momentum = torch.zeros_like(x_adv)
 
-    # 记录上一轮的精英参数 (Warm Start)
-    previous_elites = None
+    batch_size = x_adv.size(0)
+
+    # per-image warm start elites: list length=batch, each element is list[num_keep] of params
+    previous_elites_per_image = None
+
+    assert models is not None and len(models) > 0, "models (ensemble) must be a non-empty list"
 
     for t in range(iterations):
-        # 1. 演化筛选阶段 (Evolutionary Search)
-        # Ensure all models are in eval mode
         for m in models:
             m.eval()
-        
-        # A. 采样与继承 (Sampling & Inheritance)
+
+        # ---- Evolutionary Search (vectorized over batch for losses) ----
         current_params = []
-        
-        if t == 0 or previous_elites is None:
-            # 第一轮：完全随机采样
+
+        if t == 0 or previous_elites_per_image is None:
             for _ in range(num_samples):
-                p = generate_combined_params(1, num_blocks_h, num_blocks_w, max_angle, x.device, x.size(2), x.size(3))
+                p = generate_combined_params(batch_size, num_blocks_h, num_blocks_w, max_angle,
+                                             x_adv.device, x_adv.size(2), x_adv.size(3))
                 current_params.append(p)
         else:
-            # 后续轮次：继承上一轮精英 + 变异生成
-            # 1. 保留上一轮精英 (Elitism)
-            current_params.extend(previous_elites)
-            
-            # 2. 变异填充剩余名额 (Mutation)
-            num_needed = num_samples - len(current_params)
-            for _ in range(num_needed):
-                # 随机选择一个精英进行变异
-                parent = previous_elites[np.random.randint(len(previous_elites))]
-                child = mutate_combined_params(parent, num_blocks_h, num_blocks_w, max_angle, beta, x.device)
-                current_params.append(child)
+            # Reuse all previous elites as candidates (flatten + unique by id not needed)
+            pool = []
+            for elites in previous_elites_per_image:
+                pool.extend(elites)
+            # some images may share objects; copy references is OK for evaluation
+            current_params.extend(pool[:min(len(pool), num_samples)])
 
-        # B. 联合评估 (Joint Evaluation)
-        current_losses = []
+            num_needed = num_samples - len(current_params)
+            if num_needed > 0:
+                for _ in range(num_needed):
+                    # pick a random image then pick one elite from it
+                    img_idx = np.random.randint(batch_size)
+                    parent = previous_elites_per_image[img_idx][np.random.randint(num_keep)]
+                    child = mutate_combined_params(parent, num_blocks_h, num_blocks_w, max_angle, beta, x_adv.device)
+                    # ensure child's bsr angles have batch size
+                    if child['bsr']['angles'].shape[0] != batch_size:
+                        child['bsr']['angles'] = child['bsr']['angles'].expand(batch_size, -1, -1).contiguous()
+                    current_params.append(child)
+
+        losses_matrix = []
         with torch.no_grad():
             for p in current_params:
-                # 应用变换 (联合: DIM -> BSR)
                 x_tmp = apply_combined_transform(x_adv, p, num_blocks_h, num_blocks_w)
-                
-                # 计算集成损失 (Average Loss over Ensemble)
-                loss_val = 0.0
+                per_img_loss = None
                 for model in models:
-                    loss_val += F.cross_entropy(model(x_tmp), y).item()
-                loss_val /= len(models)
-                current_losses.append(loss_val)
+                    logits = model(x_tmp)
+                    l = F.cross_entropy(logits, y, reduction='none')  # (B,)
+                    per_img_loss = l if per_img_loss is None else (per_img_loss + l)
+                assert per_img_loss is not None
+                per_img_loss = per_img_loss / float(len(models))
+                losses_matrix.append(per_img_loss)
 
-        # C. 演化更新 (Evolutionary Update / Selection)
-        current_losses_np = np.array(current_losses)
-        # 选取 Top K 精英 (Loss越大越好)
-        best_indices = np.argsort(current_losses_np)[-num_keep:]
-        final_elite_params = [current_params[idx] for idx in best_indices]
-        
-        # 更新 Warm Start 记录
-        previous_elites = final_elite_params
+        losses_matrix = torch.stack(losses_matrix, dim=0)  # (num_samples, B)
 
-        # 2. 梯度对齐阶段 (Gradient Alignment)
-        for m in models:
-            m.zero_grad()
-            
-        grads = []
-        
-        for p in final_elite_params:
-            x_input = x_adv.clone().detach().requires_grad_(True)
-            x_transformed = apply_combined_transform(x_input, p, num_blocks_h, num_blocks_w)
-            
-            # 计算集成梯度
-            loss = None
+        # Select elites independently per image
+        # topk returns indices shape (num_keep, B)
+        _, topk_idx = torch.topk(losses_matrix, k=num_keep, dim=0, largest=True, sorted=False)
+
+        elites_per_image = [[] for _ in range(batch_size)]
+        for b in range(batch_size):
+            for k in range(num_keep):
+                elites_per_image[b].append(current_params[int(topk_idx[k, b].item())])
+
+        previous_elites_per_image = elites_per_image
+
+        # ---- Gradient Alignment (batch average gradient) ----
+        # gather unique elite params across batch to reduce redundant grad eval
+        unique_elites = {}
+        for b in range(batch_size):
+            for p in elites_per_image[b]:
+                unique_elites[id(p)] = p
+        unique_elites = list(unique_elites.values())
+
+        elite_grads = []
+        for p in unique_elites:
+            for m in models:
+                m.zero_grad(set_to_none=True)
+
+            x_input = x_adv.detach().clone().requires_grad_(True)
+
+            # Admix: shuffle batch to create x_rand
+            perm = torch.randperm(batch_size, device=x_adv.device)
+            x_rand = x_input[perm].detach()
+            x_admix = admix_gamma * (x_input + admix_eta * x_rand)
+
+            x_transformed = apply_combined_transform(x_admix, p, num_blocks_h, num_blocks_w)
+
+            loss_vec = None
             for model in models:
-                output = model(x_transformed)
-                if loss is None:
-                    loss = F.cross_entropy(output, y)
-                else:
-                    loss = loss + F.cross_entropy(output, y)
-            
-            if loss is not None:
-                loss = loss / len(models) # Average loss
-                loss.backward()
-                grads.append(x_input.grad.data)
-            
-        # 聚合梯度: 平均 (Average)
-        if len(grads) > 0:
-            combined_grad = torch.mean(torch.stack(grads), dim=0)
+                logits = model(x_transformed)
+                l = F.cross_entropy(logits, y, reduction='none')
+                loss_vec = l if loss_vec is None else (loss_vec + l)
+            assert loss_vec is not None
+            loss_vec = loss_vec / float(len(models))
+
+            batch_loss = loss_vec.mean()  # average over batch
+            grad = torch.autograd.grad(batch_loss, x_input, retain_graph=False, create_graph=False)[0]
+            elite_grads.append(grad.detach())
+
+        if len(elite_grads) > 0:
+            combined_grad = torch.stack(elite_grads, dim=0).mean(dim=0)
         else:
-            combined_grad = torch.zeros_like(x)
-        
-        # 3. 动量更新与对抗样本生成
+            combined_grad = torch.zeros_like(x_adv)
+
+        # ---- Momentum + update ----
         grad_norm = torch.mean(torch.abs(combined_grad), dim=(1, 2, 3), keepdim=True) + 1e-8
         momentum = mu * momentum + (combined_grad / grad_norm)
 
@@ -391,30 +410,19 @@ def eata_single_attack(x, y, models, eps, iterations, mu,
             x_adv = x_adv + alpha * torch.sign(momentum)
             x_adv = torch.clamp(x_adv, x - eps, x + eps)
             x_adv = torch.clamp(x_adv, 0, 1)
-        
-        x_adv = x_adv.detach().requires_grad_(True)
 
-    return x_adv
+    return x_adv.detach()
+
 
 def mifgsm_attack_EATA(x, y, models, eps=16 / 255, iterations=10, mu=1.0,
                        num_blocks_h=2, num_blocks_w=2, max_angle=0.2,
-                       num_samples=10, num_keep=5, diversity_prob=0.5, beta=0.1):
-    """
-    EATA Wrapper: 对Batch中的每一张图片独立执行EATA攻击 (Ensemble)
-    """
-    adv_images = []
-    # 遍历Batch中的每一张图片，确保完全独立的评估环境
-    for i in range(x.size(0)):
-        x_single = x[i:i+1]
-        y_single = y[i:i+1]
-        
-        x_adv_single = eata_single_attack(x_single, y_single, models, eps, iterations, mu,
-                                          num_blocks_h, num_blocks_w, max_angle,
-                                          num_samples, num_keep, diversity_prob, beta)
-        adv_images.append(x_adv_single)
-        
-    return torch.cat(adv_images, dim=0)
-
+                       num_samples=10, num_keep=5, diversity_prob=0.5, beta=0.1,
+                       admix_gamma=1.0, admix_eta=0.2):
+    """EATA Wrapper (batch vectorized)"""
+    return eata_single_attack(x, y, models, eps, iterations, mu,
+                              num_blocks_h, num_blocks_w, max_angle,
+                              num_samples, num_keep, diversity_prob, beta,
+                              admix_gamma=admix_gamma, admix_eta=admix_eta)
 
 def main():
     args = parse_args()
