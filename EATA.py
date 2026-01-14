@@ -1,6 +1,8 @@
 import argparse
+import copy
 import gc
 import os
+import random
 import numpy as np
 import pandas as pd
 import torch
@@ -14,6 +16,45 @@ from torch.utils.data import DataLoader,  TensorDataset
 import math
 
 from preprocess import AdvPNGDataset, get_model_output, load_source_model, get_model_prediction
+import torchvision
+
+# 指定.pth文件的根下载目录（自定义修改）
+target_pth_dir = "E:\\TransferAttack\\RuiGuoCode\\weight"  # Windows（注意转义符）
+
+# 设置TORCH_HOME环境变量
+os.environ["TORCH_HOME"] = target_pth_dir
+
+class Normalize(torch.nn.Module):
+    def __init__(self, mean, std):
+        super(Normalize, self).__init__()
+        self.register_buffer('mean', torch.Tensor(mean).reshape(1, -1, 1, 1))
+        self.register_buffer('std', torch.Tensor(std).reshape(1, -1, 1, 1))
+
+    def forward(self, input):
+        # Broadcasting handles the resizing automatically
+        return (input - self.mean) / self.std
+
+def load_source_model(model_name, device):
+    if model_name == 'inception_v3':
+        net = torchvision.models.inception_v3(pretrained=True)
+    elif model_name == 'resnet50':
+        net = torchvision.models.resnet50(pretrained=True)
+    elif model_name == 'vgg16':
+        net = torchvision.models.vgg16(pretrained=True)
+    elif model_name == 'densenet121':
+        net = torchvision.models.densenet121(pretrained=True)
+    elif model_name == 'resnet101':
+        net = torchvision.models.resnet101(pretrained=True)
+    else:
+        raise Exception("Invalid model name " + model_name)
+
+    net.eval()
+    mean = [0.485, 0.456, 0.406]
+    std = [0.229, 0.224, 0.225]
+
+    model = torch.nn.Sequential(Normalize(mean=mean, std=std), net)
+    model = model.to(device)
+    return model
 
 def generate_bsr_params(batch_size, num_blocks_h, num_blocks_w, max_angle, device, width, height):
     """生成一组BSR参数组合, 包括随机分块长度、置换和旋转角度"""
@@ -89,125 +130,137 @@ def get_block_lengths_bsr(length, num_blocks):
     rand_norm[rand_norm.argmax()] += length - rand_norm.sum()
     return tuple(rand_norm)
 
+# --- 新增：DIM 演化基因类 (参考 DIM_cli_ea.py) ---
+class EATAGene:
+    """
+    用于优化 DIM 参数的基因个体
+    参数: scale (缩放尺寸), pad_top, pad_left
+    """
+    def __init__(self, image_width=299, image_resize=331):
+        self.image_width = image_width
+        self.image_resize = image_resize
+        self.resize_scale = image_width # 初始值
+        self.pad_top = 0
+        self.pad_left = 0
+
+    def random_init(self):
+        # 随机初始化缩放尺寸 [image_width, image_resize)
+        self.resize_scale = random.randint(self.image_width, self.image_resize - 1) 
+        rem = self.image_resize - self.resize_scale
+        self.pad_top = random.randint(0, rem) if rem > 0 else 0
+        self.pad_left = random.randint(0, rem) if rem > 0 else 0
+
+    def mutate(self, mutation_rate=0.5):
+        new_gene = copy.deepcopy(self)
+        if random.random() < mutation_rate:
+            # 变异：尺寸微调
+            diff = random.choice([-2, -1, 1, 2])
+            # 限制范围 [image_width, image_resize - 1]
+            new_gene.resize_scale = max(self.image_width, min(self.image_resize - 1, new_gene.resize_scale + diff))
+            
+            # 根据新尺寸调整 Padding 约束
+            rem = self.image_resize - new_gene.resize_scale
+            # 变异：Padding 微调
+            p_diff = random.choice([-2, -1, 1, 2])
+            new_gene.pad_top = max(0, min(rem, new_gene.pad_top + p_diff))
+            new_gene.pad_left = max(0, min(rem, new_gene.pad_left + p_diff))
+            
+        return new_gene
+    
+    def apply(self, x):
+        """应用 DIM 变换到 tensor x (Batch or Single)"""
+        scale = self.resize_scale
+        # 1. Resize
+        resized = F.interpolate(x, size=(scale, scale), mode='nearest')
+        
+        # 2. Pad
+        h_rem = self.image_resize - scale
+        w_rem = self.image_resize - scale
+        
+        pad_top = self.pad_top
+        pad_bottom = h_rem - pad_top
+        pad_left = self.pad_left
+        pad_right = w_rem - pad_left
+        
+        padded = F.pad(resized, (pad_left, pad_right, pad_top, pad_bottom), mode='constant', value=0)
+        
+        # 3. Resize back to original width
+        final = F.interpolate(padded, size=(self.image_width, self.image_width), mode='nearest')
+        return final
+
+# --- 修改：联合参数生成与应用 ---
+
+def generate_combined_params(batch_size, num_blocks_h, num_blocks_w, max_angle, device, width, height):
+    """生成 BSR 和 DIM 的联合参数"""
+    # 1. BSR Params
+    bsr_params = {
+        'w_perm': np.random.permutation(np.arange(num_blocks_h)),
+        'h_perm': np.random.permutation(np.arange(num_blocks_w)),
+        'angles': torch.clamp(torch.randn(batch_size, num_blocks_h, num_blocks_w, device=device) * 0.05, -max_angle, max_angle),
+        'width_length': get_block_lengths_bsr(width, num_blocks_h),
+        'height_length': get_block_lengths_bsr(height, num_blocks_w)
+    }
+    
+    # 2. DIM Params (EATAGene)
+    # create a gene
+    dim_gene = EATAGene(image_width=299, image_resize=331) # 使用 EATA 默认参数
+    dim_gene.random_init()
+    
+    return {'bsr': bsr_params, 'dim': dim_gene}
+
+def mutate_combined_params(params, num_blocks_h, num_blocks_w, max_angle, beta, device):
+    """联合变异"""
+    # 1. Mutate BSR
+    bsr_p = params['bsr']
+    noise = torch.randn_like(bsr_p['angles']) * beta
+    new_angles = torch.clamp(bsr_p['angles'] + noise, -max_angle, max_angle)
+    
+    def mutate_perm(perm, n):
+        new_perm = perm.copy()
+        if n > 1:
+            idx1, idx2 = np.random.choice(n, 2, replace=False)
+            new_perm[idx1], new_perm[idx2] = new_perm[idx2], new_perm[idx1]
+        return new_perm
+
+    new_bsr = {
+        'w_perm': mutate_perm(bsr_p['w_perm'], num_blocks_h),
+        'h_perm': mutate_perm(bsr_p['h_perm'], num_blocks_w),
+        'angles': new_angles
+    }
+    if 'width_length' in bsr_p: new_bsr['width_length'] = bsr_p['width_length']
+    if 'height_length' in bsr_p: new_bsr['height_length'] = bsr_p['height_length']
+    
+    # 2. Mutate DIM
+    new_dim = params['dim'].mutate(mutation_rate=0.5) # 使用 DIM_cli_ea 的默认 mutation_rate
+    
+    return {'bsr': new_bsr, 'dim': new_dim}
+
+def apply_combined_transform(x, params, num_blocks_h, num_blocks_w):
+    """先后应用 DIM 和 BSR"""
+    # 1. Apply DIM (using Gene)
+    x_dim = params['dim'].apply(x)
+    
+    # 2. Apply BSR
+    # apply_bsr_with_params 需要 x, params(bsr部分)
+    return apply_bsr_with_params(x_dim, params['bsr'], num_blocks_h, num_blocks_w)
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="EATA attack")
-    parser.add_argument("--model", default='inception_v3', type=str, help="source model")
-    parser.add_argument('--output_adv_dir', default='./results/EATA/images', type=str, help='adv images dir')
-    parser.add_argument('--output_csv', default='./results/EATA/results.csv', type=str, help='output CSV path')
-    parser.add_argument('--input_dir', default='./data', type=str)
-    parser.add_argument('--batchsize', default=4, type=int)
-    parser.add_argument('--eps', default=16 / 255.0, type=float)
-    parser.add_argument('--iterations', default=10, type=int)
-    parser.add_argument('--mu', default=1.0, type=float, help='momentum factor')
-    parser.add_argument('--diversity_prob', default=0.5, type=float, help='input diversity probability')
-    parser.add_argument("--num_blocks_h",default=2,type=int,help="number of blocks h")
-    parser.add_argument("--num_blocks_w",default=2,type=int,help="number of blocks w")
-    parser.add_argument("--max_angle",default=2,type=int,help="maximum angle")
-    parser.add_argument("--num_samples",default=40,type=int,help="population size (M)")
-    parser.add_argument("--num_keep",default=20,type=int,help="elite size (K)")
-    parser.add_argument("--beta", default=0.1, type=float, help="mutation scale")
+    parser = argparse.ArgumentParser(description='EATA Attack')
+    parser.add_argument('--input_dir', default='./data', type=str, help='input images dir')
+    parser.add_argument('--output_adv_dir', default='./results/eata/images', type=str, help='adv images dir')
+    parser.add_argument('--output_csv', default='./results/eata/results.csv', type=str, help='output CSV path')
+    parser.add_argument('--ensemble_models', type=str, default=['inception_v3', 'resnet50', 'vgg16'], nargs='+', help='List of ensemble model names.')
+    parser.add_argument('--batchsize', type=int, default=16, help='Batch size for processing.')
+    parser.add_argument('--iterations', type=int, default=10, help='Number of attack iterations.')
+    parser.add_argument('--mu', type=float, default=1.0, help='Momentum factor.')
+    parser.add_argument('--num_blocks_h', type=int, default=2, help='Number of blocks in height for BSR.')
+    parser.add_argument('--num_blocks_w', type=int, default=2, help='Number of blocks in width for BSR.')
+    parser.add_argument('--max_angle', type=float, default=0.2, help='Maximum rotation angle for BSR.')
+    parser.add_argument('--num_samples', type=int, default=10, help='Number of samples for evolutionary search.')
+    parser.add_argument('--num_keep', type=int, default=5, help='Number of top samples to keep for evolutionary search.')
+    parser.add_argument('--diversity_prob', type=float, default=0.5, help='Probability of applying input diversity.')
+    parser.add_argument('--beta', type=float, default=0.1, help='Mutation noise factor for evolutionary search.')
     return parser.parse_args()
-
-
-def admix(x, portion=0.2, size=3):
-    """混合输入变换"""
-    indices = torch.randperm(x.size(0))
-    admixed = []
-    for _ in range(size):
-        admixed_x = x + portion * x[indices]
-        admixed.append(admixed_x)
-    return torch.cat(admixed, dim=0)
-
-
-def input_diversity(x, image_width=299, image_resize=331, prob=0.5):
-    """输入多样性变换"""
-    if torch.rand(1).item() < prob:
-        # 随机调整大小
-        rnd = torch.randint(image_width, image_resize + 1, (1,)).item()
-        rescaled = F.interpolate(x, size=(rnd, rnd), mode='nearest')
-
-        # 随机填充
-        h_rem = image_resize - rnd
-        w_rem = image_resize - rnd
-        pad_top = torch.randint(0, h_rem + 1, (1,)).item()
-        pad_bottom = h_rem - pad_top
-        pad_left = torch.randint(0, w_rem + 1, (1,)).item()
-        pad_right = w_rem - pad_left
-
-        padded = F.pad(rescaled, (pad_left, pad_right, pad_top, pad_bottom), mode='constant', value=0)
-        padded = F.interpolate(padded, size=(image_width, image_width), mode='nearest')
-        return padded
-    else:
-        return x
-
-
-def shuffle_rotate_bsr(x, num_blocks_h=2, num_blocks_w=2, max_angle=0.2):
-    """BSR的分块旋转和打乱变换"""
-    batch_size, channels, w, h = x.shape
-
-    # 获取分块长度
-    width_length = get_block_lengths_bsr(w, num_blocks_h)
-    height_length = get_block_lengths_bsr(h, num_blocks_w)
-
-    # 生成随机排列
-    width_perm = np.random.permutation(np.arange(num_blocks_h))
-    height_perm = np.random.permutation(np.arange(num_blocks_w))
-
-    # 宽度方向分块和打乱
-    x_split_w = torch.split(x, width_length, dim=2)
-    x_w_perm = torch.cat([x_split_w[i] for i in width_perm], dim=2)
-
-    # 高度方向分块、旋转和打乱
-    x_split_h_blocks = []
-    for w_block in x_split_w:
-        h_blocks = torch.split(w_block, height_length, dim=3)
-        x_split_h_blocks.append(h_blocks)
-
-    # 应用旋转并重新组合
-    rotated_blocks = []
-    for strip_idx, strip in enumerate(x_split_h_blocks):
-        rotated_strip = []
-        for block_idx, block in enumerate(strip):
-            # 为每个块生成随机旋转角度
-            angles = torch.clamp(
-                torch.randn(batch_size, device=x.device) * 0.05,
-                -max_angle, max_angle
-            )
-
-            # 应用旋转
-            rotated_block = block.clone()
-            for i in range(batch_size):
-                if block.shape[2] > 1 and block.shape[3] > 1:  # 确保块足够大
-                    angle_matrix = torch.tensor([
-                        [math.cos(angles[i]), -math.sin(angles[i]), 0],
-                        [math.sin(angles[i]), math.cos(angles[i]), 0]
-                    ], dtype=torch.float32, device=x.device).unsqueeze(0)
-
-                    grid = F.affine_grid(angle_matrix, block[i:i + 1].size(), align_corners=False)
-                    rotated_block[i:i + 1] = F.grid_sample(block[i:i + 1], grid, mode='bilinear',
-                                                           padding_mode='zeros', align_corners=False)
-
-            rotated_strip.append(rotated_block)
-
-        # 按高度排列组合
-        rotated_strip_perm = [rotated_strip[i] for i in height_perm]
-        rotated_blocks.append(torch.cat(rotated_strip_perm, dim=3))
-
-    # 最终组合
-    x_h_perm = torch.cat(rotated_blocks, dim=2)
-    return x_h_perm
-
-
-def BSR_transform(x, num_blocks_h=2, num_blocks_w=2, max_angle=0.2, num_copies=20):
-    """BSR变换：创建多个分块旋转打乱的副本"""
-    transformed_copies = []
-    for _ in range(num_copies):
-        transformed_copy = shuffle_rotate_bsr(x, num_blocks_h, num_blocks_w, max_angle)
-        transformed_copies.append(transformed_copy)
-
-    return torch.cat(transformed_copies, dim=0)
-
 
 def mutate_bsr_params(params, num_blocks_h, num_blocks_w, max_angle, beta, device):
     """对BSR参数进行变异"""
@@ -236,96 +289,99 @@ def mutate_bsr_params(params, num_blocks_h, num_blocks_w, max_angle, beta, devic
         
     return new_params
 
-def eata_single_attack(x, y, model, eps, iterations, mu,
+def eata_single_attack(x, y, models, eps, iterations, mu,
                        num_blocks_h, num_blocks_w, max_angle,
                        num_samples, num_keep, diversity_prob, beta):
     """
-    针对单张图片的EATA攻击逻辑，确保评估和演化的独立性。
+    针对单张图片的EATA攻击逻辑 (集成演化版本)。
+    models: list of models (Ensemble)
     """
     alpha = eps / iterations
     x_adv = x.clone().requires_grad_(True)
     momentum = torch.zeros_like(x).to(x.device)
 
+    # 记录上一轮的精英参数 (Warm Start)
+    previous_elites = None
+
     for t in range(iterations):
         # 1. 演化筛选阶段 (Evolutionary Search)
-        model.eval()
+        # Ensure all models are in eval mode
+        for m in models:
+            m.eval()
         
-        # A. 采样与评估 (Initialize Population)
+        # A. 采样与继承 (Sampling & Inheritance)
         current_params = []
-        current_losses = []
         
-        with torch.no_grad():
+        if t == 0 or previous_elites is None:
+            # 第一轮：完全随机采样
             for _ in range(num_samples):
-                # 生成单张图片的变换参数 (batch_size=1)
-                p = generate_bsr_params(1, num_blocks_h, num_blocks_w, max_angle, x.device, x.size(2), x.size(3))
-                # 应用变换 (包含Input Diversity)
-                x_tmp = apply_bsr_with_params(input_diversity(x_adv, prob=diversity_prob), p, num_blocks_h, num_blocks_w)
-                # 计算损失 (Single Scalar)
-                # EATA.md: L_m = J(f(T(x)), y)
-                loss_val = F.cross_entropy(model(x_tmp), y)
-                
+                p = generate_combined_params(1, num_blocks_h, num_blocks_w, max_angle, x.device, x.size(2), x.size(3))
                 current_params.append(p)
-                current_losses.append(loss_val.item())
+        else:
+            # 后续轮次：继承上一轮精英 + 变异生成
+            # 1. 保留上一轮精英 (Elitism)
+            current_params.extend(previous_elites)
             
-            # B. 演化更新 (Evolutionary Update)
-            current_losses_np = np.array(current_losses)
-            # 选取 Top K 精英 (Loss越大越好)
-            best_indices = np.argsort(current_losses_np)[-num_keep:]
-            elite_params = [current_params[idx] for idx in best_indices]
-            
-            # 变异产生新后代补充到 M (Mutate to replace M-K)
-            mutated_params = []
-            for _ in range(num_samples - num_keep):
-                parent = elite_params[np.random.randint(len(elite_params))]
-                child = mutate_bsr_params(parent, num_blocks_h, num_blocks_w, max_angle, beta, x.device)
-                mutated_params.append(child)
-            
-            # 评估变异后代
-            mutated_losses = []
-            for p in mutated_params:
-                x_tmp = apply_bsr_with_params(input_diversity(x_adv, prob=diversity_prob), p, num_blocks_h, num_blocks_w)
-                loss_val = F.cross_entropy(model(x_tmp), y).item()
-                mutated_losses.append(loss_val)
-            
-            # 合并种群 (精英 + 变异)
-            total_params = elite_params + mutated_params
-            total_losses = current_losses_np[best_indices].tolist() + mutated_losses
-            
-            # 再次选取 Top K (最终优胜变换集)
-            final_indices = np.argsort(total_losses)[-num_keep:]
-            final_elite_params = [total_params[idx] for idx in final_indices]
+            # 2. 变异填充剩余名额 (Mutation)
+            num_needed = num_samples - len(current_params)
+            for _ in range(num_needed):
+                # 随机选择一个精英进行变异
+                parent = previous_elites[np.random.randint(len(previous_elites))]
+                child = mutate_combined_params(parent, num_blocks_h, num_blocks_w, max_angle, beta, x.device)
+                current_params.append(child)
+
+        # B. 联合评估 (Joint Evaluation)
+        current_losses = []
+        with torch.no_grad():
+            for p in current_params:
+                # 应用变换 (联合: DIM -> BSR)
+                x_tmp = apply_combined_transform(x_adv, p, num_blocks_h, num_blocks_w)
+                
+                # 计算集成损失 (Average Loss over Ensemble)
+                loss_val = 0.0
+                for model in models:
+                    loss_val += F.cross_entropy(model(x_tmp), y).item()
+                loss_val /= len(models)
+                current_losses.append(loss_val)
+
+        # C. 演化更新 (Evolutionary Update / Selection)
+        current_losses_np = np.array(current_losses)
+        # 选取 Top K 精英 (Loss越大越好)
+        best_indices = np.argsort(current_losses_np)[-num_keep:]
+        final_elite_params = [current_params[idx] for idx in best_indices]
+        
+        # 更新 Warm Start 记录
+        previous_elites = final_elite_params
 
         # 2. 梯度对齐阶段 (Gradient Alignment)
-        model.zero_grad()
+        for m in models:
+            m.zero_grad()
+            
         grads = []
         
         for p in final_elite_params:
             x_input = x_adv.clone().detach().requires_grad_(True)
-            x_transformed = apply_bsr_with_params(input_diversity(x_input, prob=diversity_prob), p, num_blocks_h, num_blocks_w)
-            output = model(x_transformed)
-            loss = F.cross_entropy(output, y)
-            loss.backward()
+            x_transformed = apply_combined_transform(x_input, p, num_blocks_h, num_blocks_w)
             
-            grads.append(x_input.grad.data)
+            # 计算集成梯度
+            loss = None
+            for model in models:
+                output = model(x_transformed)
+                if loss is None:
+                    loss = F.cross_entropy(output, y)
+                else:
+                    loss = loss + F.cross_entropy(output, y)
             
-        # 计算对齐权重 (Softmax based on Cosine Similarity with Momentum)
-        if t > 0 and len(grads) > 0:
-            cos_sims = []
-            flat_momentum = momentum.view(1, -1)
-            for g in grads:
-                flat_g = g.view(1, -1)
-                sim = F.cosine_similarity(flat_g, flat_momentum).item()
-                cos_sims.append(sim)
+            if loss is not None:
+                loss = loss / len(models) # Average loss
+                loss.backward()
+                grads.append(x_input.grad.data)
             
-            cos_sims = torch.tensor(cos_sims, device=x.device)
-            weights = F.softmax(cos_sims, dim=0)
+        # 聚合梯度: 平均 (Average)
+        if len(grads) > 0:
+            combined_grad = torch.mean(torch.stack(grads), dim=0)
         else:
-            weights = torch.ones(len(grads), device=x.device) / len(grads)
-            
-        # 聚合梯度
-        combined_grad = torch.zeros_like(x)
-        for idx, g in enumerate(grads):
-            combined_grad += weights[idx] * g
+            combined_grad = torch.zeros_like(x)
         
         # 3. 动量更新与对抗样本生成
         grad_norm = torch.mean(torch.abs(combined_grad), dim=(1, 2, 3), keepdim=True) + 1e-8
@@ -340,11 +396,11 @@ def eata_single_attack(x, y, model, eps, iterations, mu,
 
     return x_adv
 
-def mifgsm_attack_EATA(x, y, model, eps=16 / 255, iterations=10, mu=1.0,
+def mifgsm_attack_EATA(x, y, models, eps=16 / 255, iterations=10, mu=1.0,
                        num_blocks_h=2, num_blocks_w=2, max_angle=0.2,
                        num_samples=10, num_keep=5, diversity_prob=0.5, beta=0.1):
     """
-    EATA Wrapper: 对Batch中的每一张图片独立执行EATA攻击
+    EATA Wrapper: 对Batch中的每一张图片独立执行EATA攻击 (Ensemble)
     """
     adv_images = []
     # 遍历Batch中的每一张图片，确保完全独立的评估环境
@@ -352,7 +408,7 @@ def mifgsm_attack_EATA(x, y, model, eps=16 / 255, iterations=10, mu=1.0,
         x_single = x[i:i+1]
         y_single = y[i:i+1]
         
-        x_adv_single = eata_single_attack(x_single, y_single, model, eps, iterations, mu,
+        x_adv_single = eata_single_attack(x_single, y_single, models, eps, iterations, mu,
                                           num_blocks_h, num_blocks_w, max_angle,
                                           num_samples, num_keep, diversity_prob, beta)
         adv_images.append(x_adv_single)
@@ -365,11 +421,21 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print("Using device:", device)
 
-    # 初始化模型仓库
+    # 初始化模型仓库 (Target models)
     model_repo = ModelRepository(device)
 
     # --- 1. 攻击阶段：在内存中生成 ---
-    source_model = load_source_model(args.model, device)
+    # Load Ensemble Models (Updated Logic)
+    ensemble_models = []
+    print(f"Loading ensemble models: {args.ensemble_models}")
+    
+    # 使用新的 load_source_model 函数加载所有模型
+    for model_name in args.ensemble_models:
+        model = load_source_model(model_name, device)
+        ensemble_models.append(model)
+    
+    # We use the first model in ensemble as a reference for logging "Source Prediction"
+    ref_model = ensemble_models[0]
 
     label_csv_path = os.path.join(args.input_dir, 'labels.csv')
     img_root = os.path.join(args.input_dir, 'images')
@@ -390,16 +456,16 @@ def main():
     source_results = []
     adv_images_storage = []  # 用于暂存对抗样本 (CPU Tensor)
 
-    print(f"\n[Step 1/3] Attacking in Memory...")
+    print(f"\n[Step 1/3] Attacking in Memory using Ensemble EATA...")
 
     for x_batch, y_batch, filename_batch in tqdm(loader, desc="Attacking"):
         x_batch, y_batch = x_batch.to(device), y_batch.to(device)
 
-        # 记录原始预测
-        source_orig_preds = get_model_prediction(source_model, x_batch)
+        # 记录原始预测 (Reference Model)
+        source_orig_preds = get_model_prediction(ref_model, x_batch)
 
-        # 生成对抗样本
-        x_adv_batch = mifgsm_attack_EATA(x_batch, y_batch, source_model,
+        # 生成对抗样本 (Ensemble Attack)
+        x_adv_batch = mifgsm_attack_EATA(x_batch, y_batch, ensemble_models,
                                 iterations=args.iterations,
                                 mu=args.mu,
                                 num_blocks_h=args.num_blocks_h,
@@ -410,8 +476,8 @@ def main():
                                 diversity_prob=args.diversity_prob,
                                 beta=args.beta)
 
-        # 记录攻击后预测
-        source_adv_preds = get_model_prediction(source_model, x_adv_batch)
+        # 记录攻击后预测 (Reference Model)
+        source_adv_preds = get_model_prediction(ref_model, x_adv_batch)
 
         # 将生成的对抗样本移至 CPU 并存储，释放显存
         adv_images_storage.append(x_adv_batch.cpu())
@@ -420,7 +486,6 @@ def main():
             true_label = int(y_batch[i].item()) + 1
             s_adv_idx = int(source_adv_preds[i]) + 1
             s_orig_idx = int(source_orig_preds[i]) + 1
-            print(f"{s_orig_idx}\t{s_adv_idx}\t{true_label}")
             source_results.append({
                 "filename": filename_batch[i],
                 "true_label": true_label,
@@ -430,7 +495,8 @@ def main():
             })
 
     # 彻底释放源模型显存
-    del source_model
+    del ensemble_models
+    del ref_model
     torch.cuda.empty_cache()
 
     # --- 2. 验证阶段：直接使用内存中的 Tensor ---
@@ -442,13 +508,20 @@ def main():
     adv_mem_loader = DataLoader(adv_mem_dataset, batch_size=args.batchsize, shuffle=False,pin_memory=True)
 
     all_model_names = model_repo.get_all_model_names()
-    target_names = [name for name in all_model_names if name != args.model]
+    # Exclude all ensemble models from target list to properly measure transferability
+    target_names = [name for name in all_model_names if name not in args.ensemble_models]
+    
+    # Warning: Standard torchvision models (inception_v3, resnet50 etc) might not be in ModelRepository 
+    # if ModelRepository only contains tf2torch models.
+    # The user asked to update "EATA.py" but kept 'models.py' intact.
+    # If the user wants to test transferability against *other* models in ModelRepository, 
+    # we should check if they exist.
+    # We will iterate available models in ModelRepository.
+    
     target_predictions = {name: [] for name in target_names}
 
     for model_name in target_names:
         print(f"  --> Testing target model: {model_name}")
-        # 这里建议你根据之前讨论的，实现一个 load_single_model 或者 load_source_model
-        # 假设这里依然通过 repo 加载
         current_model_info = model_repo.load_single_model(model_name)
         model = current_model_info['model']
         model.eval()
@@ -494,8 +567,13 @@ def main():
 
     # 打印总结
     total_samples = len(source_results)
+    
+    # Updated Summary output
+    print(f"\nEnsemble Source Attack Success Rate (evaluated on primary model):")
     source_rate = sum(1 for r in source_results if r['source_attack_success']) / total_samples * 100
-    print(f"\nSource Model ({args.model}) Success Rate: {source_rate:.1f}%")
+    print(f"  Reference Model ({args.ensemble_models[0]}) Fooling Rate: {source_rate:.1f}%")
+    
+    print("\nTransfer Success Rates (Target Models):")
     for name, count in model_success_counts.items():
         print(f"  {name}: {count}/{total_samples} ({count / total_samples * 100:.1f}%)")
 
