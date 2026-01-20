@@ -101,9 +101,15 @@ def parse_args():
     parser.add_argument("--distortion_scale", default=0.06, type=float, help="perspective distortion scale (BCTOT D)")
 
     # 保存第 N 次迭代的中间副本/变换图
-    parser.add_argument('--save_iter5', action='store_true', help='save intermediate transformed copies at iteration N')
-    parser.add_argument('--save_iter', default=5, type=int, help='which iteration to dump (1-based)')
+    # 约定：save_iter<=0 视为关闭；>0 则在该迭代保存
+    # 为了兼容旧用法，保留 --save_iter5，但默认不需要它
+    parser.add_argument('--save_iter5', action='store_true', help='(deprecated) enable save_iter (kept for compatibility)')
+    parser.add_argument('--save_iter', default=0, type=int, help='which iteration to dump (1-based); <=0 disables')
     parser.add_argument('--save_trans_dir', default='./results/BSR/trans_debug', type=str, help='dir to save intermediate transformed images')
+
+    # 调试：只跑一个 batch，跑完就退出（通常配合 --save_iter 1）
+    parser.add_argument('--one_batch', action='store_true', help='debug: only attack the first batch and exit after saving')
+    parser.set_defaults(one_batch=False)
 
     return parser.parse_args()
 
@@ -634,6 +640,10 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print("Using device:", device)
 
+    # 如果启用保存，提前创建目录，确保你能看到 ./results/BSR/trans_debug
+    if (args.save_iter and args.save_iter > 0) or args.save_iter5:
+        os.makedirs(args.save_trans_dir, exist_ok=True)
+
     # 初始化模型仓库
     model_repo = ModelRepository(device)
 
@@ -661,7 +671,7 @@ def main():
 
     print(f"\n[Step 1/3] Attacking in Memory...")
 
-    for x_batch, y_batch, filename_batch in tqdm(loader, desc="Attacking"):
+    for batch_idx, (x_batch, y_batch, filename_batch) in enumerate(tqdm(loader, desc="Attacking")):
         x_batch = x_batch.to(device)
         y_batch = (y_batch+1).to(device)
 
@@ -686,8 +696,8 @@ def main():
             p_swap=args.p_swap,
             distortion_scale=args.distortion_scale,
             bsr=args.bsr,
-            save_iter=(args.save_iter if args.save_iter5 else None),
-            save_trans_dir=(args.save_trans_dir if args.save_iter5 else None),
+            save_iter=(args.save_iter if args.save_iter > 0 else (5 if args.save_iter5 else None)),
+            save_trans_dir=(args.save_trans_dir if (args.save_iter > 0 or args.save_iter5) else None),
             filenames=list(filename_batch),
         )
 
@@ -707,6 +717,15 @@ def main():
                 "source_adv_pred": s_adv_idx,
                 "source_attack_success": s_adv_idx != true_label
             })
+
+        # 调试：只 attack 一个 batch 就退出（保存会在 mifgsm_attack_BSR 内部触发）
+        if args.one_batch:
+            print("[DEBUG] --one_batch enabled: stopping after first batch.")
+            # 只保存本 batch 的对抗样本到 output_adv_dir，方便对照
+            os.makedirs(args.output_adv_dir, exist_ok=True)
+            for i in range(x_adv_batch.size(0)):
+                save_image(x_adv_batch[i].detach().cpu(), os.path.join(args.output_adv_dir, filename_batch[i]))
+            return
 
     # 彻底释放源模型显存
     del source_model
