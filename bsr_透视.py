@@ -100,6 +100,11 @@ def parse_args():
     parser.add_argument("--p_swap", default=0.5, type=float, help="adjacent swap probability")
     parser.add_argument("--distortion_scale", default=0.06, type=float, help="perspective distortion scale (BCTOT D)")
 
+    # 保存第 N 次迭代的中间副本/变换图
+    parser.add_argument('--save_iter5', action='store_true', help='save intermediate transformed copies at iteration N')
+    parser.add_argument('--save_iter', default=5, type=int, help='which iteration to dump (1-based)')
+    parser.add_argument('--save_trans_dir', default='./results/BSR/trans_debug', type=str, help='dir to save intermediate transformed images')
+
     return parser.parse_args()
 
 
@@ -460,15 +465,69 @@ def _perspective_permutation_transform(
     return torch.cat(copies, dim=0)
 
 
+def _save_transformed_copies(
+    x_aug: torch.Tensor,
+    filenames: list[str],
+    *,
+    out_dir: str,
+    iter_idx_1based: int,
+    num_copies: int,
+):
+    """保存 x_aug 中的中间副本。
+
+    约定：x_aug 的 batch 维 = B * num_copies，按 copy-major 拼接：
+    [copy0_B, copy1_B, ..., copy{num_copies-1}_B]
+    """
+    os.makedirs(out_dir, exist_ok=True)
+
+    B = len(filenames)
+    if B == 0:
+        return
+
+    # 安全兜底：尺寸不符就不保存，避免误存
+    if x_aug.size(0) != B * num_copies:
+        return
+
+    x_aug = x_aug.detach().clamp(0, 1).cpu()
+
+    for c in range(num_copies):
+        start = c * B
+        end = (c + 1) * B
+        chunk = x_aug[start:end]
+        for i, fn in enumerate(filenames):
+            base, _ = os.path.splitext(fn)
+            save_path = os.path.join(out_dir, f"{base}_iter{iter_idx_1based:02d}_copy{c:03d}.png")
+            save_image(chunk[i], save_path)
+
+
+def _save_trans_images(
+    x_trans: torch.Tensor,
+    filenames: list[str],
+    *,
+    out_dir: str,
+    iter_idx_1based: int,
+):
+    """保存 trans（进入 BSR/透视置换之前）的图像，batch 维为 B。"""
+    os.makedirs(out_dir, exist_ok=True)
+    x_trans = x_trans.detach().clamp(0, 1).cpu()
+
+    for i, fn in enumerate(filenames):
+        base, _ = os.path.splitext(fn)
+        save_path = os.path.join(out_dir, f"{base}_iter{iter_idx_1based:02d}_trans.png")
+        save_image(x_trans[i], save_path)
+
+
 def mifgsm_attack_BSR(x, y, model, eps=16 / 255, iterations=10, mu=1.0,
                       num_blocks_h=2, num_blocks_w=2, max_angle=0.2,
                       num_copies=20, use_diversity=True, use_admix=False,
                       portion=0.2, admix_size=3, diversity_prob=0.5,
-                      p_swap=0.3, distortion_scale=0.06, *, bsr: bool = False):
+                      p_swap=0.3, distortion_scale=0.06, *, bsr: bool = False,
+                      save_iter: int | None = None,
+                      save_trans_dir: str | None = None,
+                      filenames: Optional[list[str]] = None):
     """MI-FGSM + (BSR 或 透视+置换)。
 
-    bsr=False: 直接『透视 + 相邻置换』（无旋转）
-    bsr=True : 使用 BSR_transform（当前文件实现：相邻置换 + 透视 + 旋转）
+    save_iter: 若给定(1-based)，则在该次迭代保存 x_aug 的所有 num_copies 变换副本。
     """
     alpha = eps / iterations
     x_adv = x.clone().requires_grad_(True)
@@ -486,6 +545,21 @@ def mifgsm_attack_BSR(x, y, model, eps=16 / 255, iterations=10, mu=1.0,
             y_expanded = y.repeat(admix_size * num_copies)
         else:
             y_expanded = y.repeat(num_copies)
+
+        iter_1based = i + 1
+        if (
+            save_iter is not None
+            and save_trans_dir is not None
+            and filenames is not None
+            and iter_1based == save_iter
+        ):
+            # 保存 trans（进入 BSR/透视置换之前）
+            _save_trans_images(
+                x_transformed,
+                filenames,
+                out_dir=os.path.join(save_trans_dir, 'trans'),
+                iter_idx_1based=iter_1based,
+            )
 
         if bsr:
             x_aug = BSR_transform(
@@ -505,6 +579,21 @@ def mifgsm_attack_BSR(x, y, model, eps=16 / 255, iterations=10, mu=1.0,
                 num_copies=num_copies,
                 p_swap=p_swap,
                 distortion_scale=distortion_scale,
+            )
+
+        # dump intermediate transformed copies at iteration save_iter
+        if (
+            save_iter is not None
+            and save_trans_dir is not None
+            and filenames is not None
+            and iter_1based == save_iter
+        ):
+            _save_transformed_copies(
+                x_aug,
+                filenames,
+                out_dir=os.path.join(save_trans_dir, 'copies'),
+                iter_idx_1based=iter_1based,
+                num_copies=num_copies,
             )
 
         # 前向传播
@@ -597,6 +686,9 @@ def main():
             p_swap=args.p_swap,
             distortion_scale=args.distortion_scale,
             bsr=args.bsr,
+            save_iter=(args.save_iter if args.save_iter5 else None),
+            save_trans_dir=(args.save_trans_dir if args.save_iter5 else None),
+            filenames=list(filename_batch),
         )
 
         source_adv_preds = get_model_prediction(source_model, x_adv_batch)
@@ -607,7 +699,7 @@ def main():
             true_label = int(y_batch[i].item())
             s_adv_idx = int(source_adv_preds[i])
             s_orig_idx = int(source_orig_preds[i])
-            # print(true_label, s_adv_idx)
+            print(true_label, s_adv_idx)
             source_results.append({
                 "filename": filename_batch[i],
                 "true_label": true_label,
