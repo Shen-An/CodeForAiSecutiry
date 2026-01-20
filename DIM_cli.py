@@ -10,6 +10,8 @@ from PIL import Image
 from torchvision.utils import save_image
 from tqdm import tqdm
 from torchvision import transforms
+
+from eval import eval_transferability
 from models import ModelRepository, Normalize
 from torch.utils.data import DataLoader, Dataset, TensorDataset
 
@@ -93,42 +95,42 @@ def input_diversity(x, prob=0.5):
     """
     if prob <= 0:
         return x
-    
+
     device = x.device
     B, C, H, W = x.shape
-    
+
     # 我们需要在 [299, 329] 之间为每一张图随机选择一个尺寸
     # 生成 B 个随机目标尺寸
-    rnd_scales = np.random.randint(299, 330, size=B) 
-    
+    rnd_scales = np.random.randint(299, 330, size=B)
+
     # 决定每一张图是否应用变换 (Probability check)
     apply_flags = np.random.random(B) > (1 - prob) # True means apply
-    
+
     outputs = []
-    
+
     for i in range(B):
         img = x[i:i+1] # keep 4dims: [1, C, H, W]
-        
+
         if not apply_flags[i]:
              outputs.append(img)
              continue
-             
+
         scale = rnd_scales[i]
-        
+
         # 1. Resize
         resized = F.interpolate(img, size=(scale, scale), mode='nearest')
-        
+
         # 2. Pad
         h_rem = 330 - scale
         w_rem = 330 - scale
-        
+
         pad_top = np.random.randint(0, h_rem + 1)
         pad_bottom = h_rem - pad_top
         pad_left = np.random.randint(0, w_rem + 1)
         pad_right = w_rem - pad_left
-        
+
         padded = F.pad(resized, (pad_left, pad_right, pad_top, pad_bottom), mode='constant', value=0)
-        
+
         # 3. Resize back to 299
         final = F.interpolate(padded, size=(299, 299), mode='nearest')
         outputs.append(final)
@@ -145,9 +147,9 @@ def dim_attack(x, y, model, eps=16 / 255, iterations=10, mu=1.0, prob=0.5):
 
     for _ in range(iterations):
         x_adv.requires_grad_(True)  # 启用对抗样本张量x_adv的梯度追踪功能
-        
+
         x_div = input_diversity(x_adv, prob)
-        
+
         output = get_model_output(model, x_div)
         if output.dim() == 1:
             output = output.unsqueeze(0)
@@ -204,27 +206,6 @@ def parse_args():
     return parser.parse_args()
 
 
-def load_source_model(model_name, device):
-    if model_name == 'inception_v3':
-        net = torchvision.models.inception_v3(pretrained=True)
-    elif model_name == 'resnet50':
-        net = torchvision.models.resnet50(pretrained=True)
-    elif model_name == 'vgg16':
-        net = torchvision.models.vgg16(pretrained=True)
-    elif model_name == 'densenet121':
-        net = torchvision.models.densenet121(pretrained=True)
-    elif model_name == 'resnet101':
-        net = torchvision.models.resnet101(pretrained=True)
-    else:
-        raise Exception("Invalid model name" + model_name);
-
-    net = net.to(device);
-    net.eval();
-    mean = [0.485, 0.456, 0.406]
-    std = [0.229, 0.224, 0.225]
-
-    model = torch.nn.Sequential(Normalize(mean=mean, std=std), net);
-    return model;
 
 
 def main():
@@ -233,8 +214,8 @@ def main():
     print("Using device:", device)
 
     model_repo = ModelRepository(device)
-
-    source_model = load_source_model(args.model, device)
+    source_model_info = model_repo.get_source_model(args.model)
+    source_model = source_model_info['model']
 
     label_csv_path = os.path.join(args.input_dir, 'labels.csv')
     img_root = os.path.join(args.input_dir, 'images')
@@ -270,9 +251,9 @@ def main():
         adv_images_storage.append(x_adv_batch.cpu())
 
         for i in range(x_adv_batch.size(0)):
-            true_label = int(y_batch[i].item()) + 1
-            s_adv_idx = int(source_adv_preds[i]) + 1
-            s_orig_idx = int(source_orig_preds[i]) + 1
+            true_label = int(y_batch[i].item())
+            s_adv_idx = int(source_adv_preds[i])
+            s_orig_idx = int(source_orig_preds[i])
             source_results.append({
                 "filename": filename_batch[i],
                 "true_label": true_label,
@@ -283,67 +264,7 @@ def main():
 
     del source_model
     torch.cuda.empty_cache()
-
-    print(f"\n[Step 2/3] Testing Transferability (Using Memory Storage)...")
-
-    all_adv_tensors = torch.cat(adv_images_storage, dim=0)
-    adv_mem_dataset = TensorDataset(all_adv_tensors)
-    adv_mem_loader = DataLoader(adv_mem_dataset, batch_size=args.batchsize, shuffle=False, pin_memory=True)
-
-    all_model_names = model_repo.get_all_model_names()
-    target_names = [name for name in all_model_names if name != args.model]
-    target_predictions = {name: [] for name in target_names}
-
-    for model_name in target_names:
-        print(f"  --> Testing target model: {model_name}")
-        current_model_info = model_repo.load_single_model(model_name)
-        model = current_model_info['model']
-        model.eval()
-
-        model_preds = []
-        with torch.no_grad():
-            for [x_adv_batch] in tqdm(adv_mem_loader, desc=f"Scanning {model_name}"):
-                x_adv_batch = x_adv_batch.to(device)
-                preds = get_model_prediction(model, x_adv_batch)
-                model_preds.extend(preds)
-
-        target_predictions[model_name] = model_preds
-
-        del model
-        torch.cuda.empty_cache()
-        gc.collect()
-        torch.cuda.empty_cache()
-
-    print(f"\n[Step 3/3] Saving results and images to disk...")
-
-    os.makedirs(args.output_adv_dir, exist_ok=True)
-    for idx, res in enumerate(source_results):
-        fn = res["filename"]
-        save_image(all_adv_tensors[idx], os.path.join(args.output_adv_dir, fn))
-
-    final_rows = []
-    model_success_counts = {name: 0 for name in target_names}
-    for idx, res in enumerate(source_results):
-        row = res.copy()
-        for model_name in target_names:
-            pred = int(target_predictions[model_name][idx])
-            fooled = (pred != res["true_label"])
-            row[f"{model_name}_pred"] = pred
-            row[f"{model_name}_fooled"] = fooled
-            if fooled:
-                model_success_counts[model_name] += 1
-        final_rows.append(row)
-
-    total_samples = len(source_results)
-    source_rate = sum(1 for r in source_results if r['source_attack_success']) / total_samples * 100
-    print(f"\nSource Model ({args.model}) Success Rate: {source_rate:.1f}%")
-    for name, count in model_success_counts.items():
-        print(f"  {name}: {count}/{total_samples} ({count / total_samples * 100:.1f}%)")
-
-    os.makedirs(os.path.dirname(args.output_csv), exist_ok=True)
-    pd.DataFrame(final_rows).to_csv(args.output_csv, index=False)
-    print(f"\nDetailed results saved to {args.output_csv}")
-
+    eval_transferability(source_results, adv_images_storage,args,model_repo)
 if __name__ == '__main__':
     torch.cuda.empty_cache();
     main()

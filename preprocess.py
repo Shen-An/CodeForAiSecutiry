@@ -8,6 +8,7 @@ from PIL import Image
 
 from models import Normalize
 from torch.utils.data import Dataset
+import timm
 
 
 # --- 自定义数据集：从本地加载生成的 PNG 对抗样本 ---
@@ -68,26 +69,3 @@ def get_model_prediction(model, x):
 
     # 5. 确保返回值是至少一维的numpy数组，最终强制转为一维数组（长度等于批量大小batch）
     return np.atleast_1d(preds)
-
-
-def load_source_model(model_name, device):
-    if model_name == 'inception_v3':
-        net = torchvision.models.inception_v3(pretrained=True)
-    elif model_name == 'resnet50':
-        net = torchvision.models.resnet50(pretrained=True)
-    elif model_name == 'vgg16':
-        net = torchvision.models.vgg16(pretrained=True)
-    elif model_name == 'densenet121':
-        net = torchvision.models.densenet121(pretrained=True)
-    elif model_name == 'resnet101':
-        net = torchvision.models.resnet101(pretrained=True)
-    else:
-        raise Exception("Invalid model name" + model_name);
-
-    net = net.to(device);
-    net.eval();
-    mean = [0.485, 0.456, 0.406]
-    std = [0.229, 0.224, 0.225]
-
-    model = torch.nn.Sequential(Normalize(mean=mean, std=std), net);
-    return model;
