@@ -1,16 +1,9 @@
 import os
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import torchvision
-import torchvision.models as models
-import torchvision.transforms as transforms
-import numpy as np
+from typing import List
 from PIL import Image
-import cv2
-import pandas as pd
-import math
-from tqdm.notebook import tqdm
+
 from torch_nets import (
     tf2torch_inception_v3,
     tf2torch_inception_v4,
@@ -24,7 +17,6 @@ from torch_nets import (
     tf2torch_ens_adv_inc_res_v2,
 )
 
-
 class Normalize(nn.Module):
     def __init__(self, mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]):
         super(Normalize, self).__init__()
@@ -36,7 +28,6 @@ class Normalize(nn.Module):
         self.std = self.std.to(input.device)
         return (input - self.mean) / self.std
 
-
 class ModelRepository:
     """Model repository class for managing source and target models"""
 
@@ -47,7 +38,6 @@ class ModelRepository:
         self._load_all_models()
 
     def _load_model(self, net_name):
-        """Load converted model following torch_attack.py style"""
         model_path = os.path.join(self.model_dir, net_name + '.npy')
 
         if net_name == 'tf2torch_inception_v3':
@@ -84,7 +74,6 @@ class ModelRepository:
         return model
 
     def _load_all_models(self):
-        """Load all models into the repository following torch_attack.py style"""
         model_names = [
             'tf2torch_inception_v3',
             'tf2torch_inception_v4',
@@ -92,7 +81,7 @@ class ModelRepository:
             'tf2torch_resnet_v2_101',
             'tf2torch_resnet_v2_152',
             'tf2torch_inc_res_v2',
-            # 'tf2torch_adv_inception_v3',不要
+            'tf2torch_adv_inception_v3',
             'tf2torch_ens3_adv_inc_v3',
             'tf2torch_ens4_adv_inc_v3',
             'tf2torch_ens_adv_inc_res_v2'
@@ -109,10 +98,9 @@ class ModelRepository:
                 }
 
     def get_source_model(self, model_name='tf2torch_inception_v3'):
-        if model_name in self.models:
-            return self.models[model_name]
-        else:
+        if model_name not in self.models:
             raise ValueError(f"Model {model_name} does not exist in repository")
+        return self.models[model_name]
 
     def get_target_models(self, model_names=None):
         """Get multiple target models"""
@@ -136,40 +124,38 @@ class ModelRepository:
         else:
             raise ValueError(f"Model {model_name} does not exist in repository")
 
-    def load_single_model(self, model_name):
-        """
-        根据模型名称加载单个模型，并返回包含模型的字典。
-        直接调用 _load_model，它已经包含了 Normalize 层。
-        """
-        print(f"Loading {model_name}...")
 
-        # 直接获取模型，_load_model 内部已经处理了 .to(device) 和 .eval()
-        model = self._load_model(model_name)
+class EnsembleModel(nn.Module):
+    def __init__(self, models: List[nn.Module], device: torch.device):
+        super(EnsembleModel, self).__init__()
+        self.models = nn.ModuleList(models).to(device)
+        self.device = device
 
-        # 保持一致性，返回字典格式
-        return {
-            'model': model,
-            'input_size': 299,
-            'type': 'both',
-            'normalization': 'tensorflow'
-        }
+    def forward(self, x):
+        outputs = []
+        for model in self.models:
+            output = model(x)
 
+            if isinstance(output, tuple):
+                output = output[0]
+            elif isinstance(output, list):
+                output = output[0]
+
+            if output.dim() == 1:
+                output = output.unsqueeze(0)
+            elif output.dim() > 2:
+                output = output.view(output.size(0), -1)
+            outputs.append(output)
+
+        avg_output = torch.stack(outputs).mean(dim=0)
+        return avg_output
+
+    def eval(self):
+        for model in self.models:
+            model.eval()
+        return self
 
 def load_image_and_transform(img_path, transform, device):
-    """Unified image loading and transformation function"""
+    """Load and transform image"""
     img = Image.open(img_path).convert("RGB")
     return transform(img).unsqueeze(0).to(device)
-
-
-def calculate_success_rate(results_df, success_status="Success"):
-    """Calculate attack success rate"""
-    success_results = results_df[results_df["status"] == success_status]
-
-    if len(success_results) == 0:
-        return 0, 0, 0
-
-    PHFRT_target_success = len(
-        success_results[success_results["target_adv_pred_PHFRT"] != success_results["true_label"]])
-    PHFRT_target_success_rate = PHFRT_target_success / len(success_results) * 100
-
-    return len(success_results), PHFRT_target_success_rate

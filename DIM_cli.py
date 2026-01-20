@@ -10,11 +10,8 @@ from PIL import Image
 from torchvision.utils import save_image
 from tqdm import tqdm
 from torchvision import transforms
-
-from eval import eval_transferability
 from models import ModelRepository, Normalize
 from torch.utils.data import DataLoader, Dataset, TensorDataset
-
 
 
 # --- 自定义数据集：从本地加载生成的 PNG 对抗样本 ---
@@ -37,7 +34,6 @@ class AdvPNGDataset(Dataset):
             img = self.transform(img)
         # 返回 image, label, filename
         return img, row['label'], fn
-
 
 
 def mi_fgsm_attack(x, y, model, eps=16 / 255.0, iterations=20, mu=1.0, **kwargs):
@@ -86,7 +82,6 @@ def mi_fgsm_attack(x, y, model, eps=16 / 255.0, iterations=20, mu=1.0, **kwargs)
     return x_adv.detach()
 
 
-
 # 输入多样性增强 (DIM) - Batched Version (Independent per image)
 def input_diversity(x, prob=0.5):
     """
@@ -104,16 +99,16 @@ def input_diversity(x, prob=0.5):
     rnd_scales = np.random.randint(299, 330, size=B)
 
     # 决定每一张图是否应用变换 (Probability check)
-    apply_flags = np.random.random(B) > (1 - prob) # True means apply
+    apply_flags = np.random.random(B) > (1 - prob)  # True means apply
 
     outputs = []
 
     for i in range(B):
-        img = x[i:i+1] # keep 4dims: [1, C, H, W]
+        img = x[i:i + 1]  # keep 4dims: [1, C, H, W]
 
         if not apply_flags[i]:
-             outputs.append(img)
-             continue
+            outputs.append(img)
+            continue
 
         scale = rnd_scales[i]
 
@@ -169,7 +164,6 @@ def dim_attack(x, y, model, eps=16 / 255, iterations=10, mu=1.0, prob=0.5):
     return x_adv.detach()
 
 
-
 def get_model_output(model, x):
     output = model(x);
     if isinstance(output, (tuple, list)):
@@ -194,7 +188,8 @@ def get_model_prediction(model, x):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="DIM attack")
-    parser.add_argument("--model", default='inception_v3', type=str, help="source model")
+    # 改为使用本项目本地 tf2torch 权重模型，避免 torchvision 联网下载
+    parser.add_argument("--model",default='tf2torch_inception_v3',type=str,help="source model")
     parser.add_argument('--output_adv_dir', default='./results/dim/images', type=str, help='adv images dir')
     parser.add_argument('--output_csv', default='./results/dim/results.csv', type=str, help='output CSV path')
     parser.add_argument('--input_dir', default='./data', type=str)
@@ -206,14 +201,14 @@ def parse_args():
     return parser.parse_args()
 
 
-
-
 def main():
     args = parse_args()
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print("Using device:", device)
 
     model_repo = ModelRepository(device)
+
+    # 使用本地 tf2torch 模型作为 source
     source_model_info = model_repo.get_source_model(args.model)
     source_model = source_model_info['model']
 
@@ -238,8 +233,8 @@ def main():
     print(f"\n[Step 1/3] Attacking in Memory...")
 
     for x_batch, y_batch, filename_batch in tqdm(loader, desc="Attacking"):
-        x_batch, y_batch = x_batch.to(device), y_batch.to(device)
-
+        x_batch = x_batch.to(device)
+        y_batch = (y_batch + 1).to(device)
         source_orig_preds = get_model_prediction(source_model, x_batch)
 
         x_adv_batch = dim_attack(x_batch, y_batch, source_model,
@@ -247,13 +242,14 @@ def main():
                                  mu=args.mu, prob=args.prob)
 
         source_adv_preds = get_model_prediction(source_model, x_adv_batch)
-
         adv_images_storage.append(x_adv_batch.cpu())
 
         for i in range(x_adv_batch.size(0)):
             true_label = int(y_batch[i].item())
             s_adv_idx = int(source_adv_preds[i])
             s_orig_idx = int(source_orig_preds[i])
+            print(true_label, s_adv_idx)
+
             source_results.append({
                 "filename": filename_batch[i],
                 "true_label": true_label,
@@ -264,7 +260,81 @@ def main():
 
     del source_model
     torch.cuda.empty_cache()
-    eval_transferability(source_results, adv_images_storage,args,model_repo)
+
+    print(f"\n[Step 2/3] Testing Transferability (Using Memory Storage)...")
+
+    all_adv_tensors = torch.cat(adv_images_storage, dim=0)
+    adv_mem_dataset = TensorDataset(all_adv_tensors)
+    adv_mem_loader = DataLoader(adv_mem_dataset, batch_size=args.batchsize, shuffle=False, pin_memory=True)
+
+    all_model_names = model_repo.get_all_model_names()
+    # 统一排除 source model（现在 source/target 命名体系一致）
+    target_names = [name for name in all_model_names if name != args.model]
+    target_predictions = {name: [] for name in target_names}
+
+    for model_name in target_names:
+        print(f"  --> Testing target model: {model_name}")
+        current_model_info = model_repo.load_single_model(model_name)
+        model = current_model_info['model']
+        model.eval()
+
+        model_preds = []
+        with torch.no_grad():
+            for [x_adv_batch] in tqdm(adv_mem_loader, desc=f"Scanning {model_name}"):
+                x_adv_batch = x_adv_batch.to(device)
+                preds = get_model_prediction(model, x_adv_batch)
+                model_preds.extend(preds)
+
+        target_predictions[model_name] = model_preds
+
+        # 仅对第一个 target 模型做一次 quick sanity-check，方便定位“为什么都预测对”
+        if len(model_preds) > 0:
+            sample_k = min(5, len(model_preds))
+            print("    [sanity] first samples (true / source_orig / source_adv / target_adv):")
+            for j in range(sample_k):
+                print(
+                    f"      {j}: {source_results[j]['true_label']} / "
+                    f"{source_results[j]['source_original_pred']} / "
+                    f"{source_results[j]['source_adv_pred']} / "
+                    f"{model_preds[j]}"
+                )
+
+        del model
+        torch.cuda.empty_cache()
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    print(f"\n[Step 3/3] Saving results and images to disk...")
+
+    os.makedirs(args.output_adv_dir, exist_ok=True)
+    for idx, res in enumerate(source_results):
+        fn = res["filename"]
+        save_image(all_adv_tensors[idx], os.path.join(args.output_adv_dir, fn))
+
+    final_rows = []
+    model_success_counts = {name: 0 for name in target_names}
+    for idx, res in enumerate(source_results):
+        row = res.copy()
+        for model_name in target_names:
+            pred = int(target_predictions[model_name][idx])
+            fooled = (pred != res["true_label"])
+            row[f"{model_name}_pred"] = pred
+            row[f"{model_name}_fooled"] = fooled
+            if fooled:
+                model_success_counts[model_name] += 1
+        final_rows.append(row)
+
+    total_samples = len(source_results)
+    source_rate = sum(1 for r in source_results if r['source_attack_success']) / total_samples * 100
+    print(f"\nSource Model ({args.model}) Success Rate: {source_rate:.1f}%")
+    for name, count in model_success_counts.items():
+        print(f"  {name}: {count}/{total_samples} ({count / total_samples * 100:.1f}%)")
+
+    os.makedirs(os.path.dirname(args.output_csv), exist_ok=True)
+    pd.DataFrame(final_rows).to_csv(args.output_csv, index=False)
+    print(f"\nDetailed results saved to {args.output_csv}")
+
+
 if __name__ == '__main__':
     torch.cuda.empty_cache();
     main()

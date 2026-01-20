@@ -15,7 +15,7 @@ from models import ModelRepository
 from torch.utils.data import DataLoader, TensorDataset
 import math
 
-from preprocess import AdvPNGDataset, get_model_output, load_source_model, get_model_prediction
+from preprocess import AdvPNGDataset, get_model_output, get_model_prediction
 
 
 def admix(x, portion=0.2, size=3):
@@ -64,7 +64,7 @@ def get_block_lengths_bsr(length, num_blocks):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="BSR attack")
-    parser.add_argument("--model", default='inception_v3', type=str, help="source model")
+    parser.add_argument("--model", default='tf2torch_inception_v3', type=str, help="source model")
     parser.add_argument('--output_adv_dir', default='./results/BSR/images', type=str, help='adv images dir')
     parser.add_argument('--output_csv', default='./results/BSR/results.csv', type=str, help='output CSV path')
     parser.add_argument('--input_dir', default='./data', type=str)
@@ -77,13 +77,29 @@ def parse_args():
     parser.add_argument("--num_blocks_w", default=2, type=int, help="number of blocks w")
     parser.add_argument("--max_angle", default=2, type=int, help="maximum angle")
     parser.add_argument("--num_copies", default=20, type=int, help="number of copies")
-    parser.add_argument("--use_diversity", default=True, type=bool, help="use diversity")
-    parser.add_argument("--use_admix", default=False, type=bool, help="use admix")
-    parser.add_argument("--portion", default=0.2, help="portion admix")
-    parser.add_argument("--admix_size", default=3, help="admix size")
-    # BSPP (Adjacent-Swap + Perspective) params
-    parser.add_argument("--p_swap", default=0.3, type=float, help="adjacent swap probability")
+
+    # NOTE: argparse 的 type=bool 不可靠（传入字符串 'False' 也会变 True），改用 store_true/store_false
+    parser.add_argument('--use_diversity', dest='use_diversity', action='store_true', help='enable diversity')
+    parser.add_argument('--no_diversity', dest='use_diversity', action='store_false', help='disable diversity')
+    parser.set_defaults(use_diversity=False)
+
+    parser.add_argument('--use_admix', dest='use_admix', action='store_true', help='enable admix')
+    parser.add_argument('--no_admix', dest='use_admix', action='store_false', help='disable admix')
+    parser.set_defaults(use_admix=False)
+
+    parser.add_argument("--portion", default=0.2, type=float, help="portion admix")
+    parser.add_argument("--admix_size", default=3, type=int, help="admix size")
+
+    # 你要的单参数开关：
+    #   --bsr      => True, 使用 BSR（当前实现：相邻置换 + 透视 + 旋转）
+    #   不加参数   => False, 不使用 BSR，改为“直接 透视 + 置换”（无旋转）
+    parser.add_argument('--bsr', action='store_true', help='use BSR (AS+perspective+rotation)')
+    parser.set_defaults(bsr=False)
+
+    # Adjacent-Swap + Perspective params
+    parser.add_argument("--p_swap", default=0.5, type=float, help="adjacent swap probability")
     parser.add_argument("--distortion_scale", default=0.06, type=float, help="perspective distortion scale (BCTOT D)")
+
     return parser.parse_args()
 
 
@@ -395,12 +411,65 @@ def BSR_transform(x, num_blocks_h=2, num_blocks_w=2, max_angle=0.2, num_copies=2
     return torch.cat(transformed_copies, dim=0)
 
 
+def _perspective_permutation_transform(
+    x: torch.Tensor,
+    *,
+    num_blocks_h: int,
+    num_blocks_w: int,
+    num_copies: int,
+    p_swap: float,
+    distortion_scale: float,
+) -> torch.Tensor:
+    """不使用 BSR 时：只做『相邻置换 + 透视』(不做旋转)，复制 num_copies 次。"""
+    copies = []
+    B, C, w, h = x.shape
+
+    for _ in range(num_copies):
+        params = generate_bspp_params(w, h, num_blocks_h, num_blocks_w, p_swap=p_swap)
+
+        # 1) T_AS（只做相邻置换，保持尺寸不变）
+        x_swapped = _adjacent_swap_reconstruct(
+            x,
+            params.width_length,
+            params.height_length,
+            params.swapped_width_length,
+            params.swapped_height_length,
+        )
+
+        # 2) per-block perspective（不做 rotation）
+        blocks = _split_blocks(x_swapped, params.swapped_width_length, params.swapped_height_length)
+        for i in range(num_blocks_h):
+            for j in range(num_blocks_w):
+                block = blocks[i][j]
+                bH, bW = block.shape[2], block.shape[3]
+                if bH <= 1 or bW <= 1:
+                    continue
+
+                out_block = block.clone()
+                for bi in range(B):
+                    single = block[bi:bi + 1]
+                    src_n, dst_n = _rand_perspective_params(bH, bW, distortion_scale, device=x.device)
+                    H_mat = _homography_dlt(src_n, dst_n)
+                    single = _warp_perspective_grid_sample(single, H_mat)
+                    out_block[bi:bi + 1] = single
+
+                blocks[i][j] = out_block
+
+        copies.append(_merge_blocks(blocks))
+
+    return torch.cat(copies, dim=0)
+
+
 def mifgsm_attack_BSR(x, y, model, eps=16 / 255, iterations=10, mu=1.0,
                       num_blocks_h=2, num_blocks_w=2, max_angle=0.2,
                       num_copies=20, use_diversity=True, use_admix=False,
                       portion=0.2, admix_size=3, diversity_prob=0.5,
-                      p_swap=0.3, distortion_scale=0.06):
-    """BSR版本的MI-FGSM攻击"""
+                      p_swap=0.3, distortion_scale=0.06, *, bsr: bool = False):
+    """MI-FGSM + (BSR 或 透视+置换)。
+
+    bsr=False: 直接『透视 + 相邻置换』（无旋转）
+    bsr=True : 使用 BSR_transform（当前文件实现：相邻置换 + 透视 + 旋转）
+    """
     alpha = eps / iterations
     x_adv = x.clone().requires_grad_(True)
     momentum = torch.zeros_like(x).to(x.device)
@@ -418,23 +487,36 @@ def mifgsm_attack_BSR(x, y, model, eps=16 / 255, iterations=10, mu=1.0,
         else:
             y_expanded = y.repeat(num_copies)
 
-        # 应用BSR变换
-        x_bsr = BSR_transform(x_transformed, num_blocks_h, num_blocks_w, max_angle, num_copies,
-                              distortion_scale=distortion_scale, p_swap=p_swap)
+        if bsr:
+            x_aug = BSR_transform(
+                x_transformed,
+                num_blocks_h,
+                num_blocks_w,
+                max_angle,
+                num_copies,
+                distortion_scale=distortion_scale,
+                p_swap=p_swap,
+            )
+        else:
+            x_aug = _perspective_permutation_transform(
+                x_transformed,
+                num_blocks_h=num_blocks_h,
+                num_blocks_w=num_blocks_w,
+                num_copies=num_copies,
+                p_swap=p_swap,
+                distortion_scale=distortion_scale,
+            )
 
         # 前向传播
-        output = model(x_bsr)
+        output = model(x_aug)
 
         # 处理不同输出类型
-        if isinstance(output, tuple):
-            output = output[0]
-        elif isinstance(output, list):
+        if isinstance(output, (tuple, list)):
             output = output[0]
 
         if not isinstance(output, torch.Tensor):
             raise ValueError(f"Unexpected output type: {type(output)}")
 
-        # 计算损失并反传（梯度会累积到 x_adv）
         loss = F.cross_entropy(output, y_expanded)
 
         model.zero_grad()
@@ -442,17 +524,12 @@ def mifgsm_attack_BSR(x, y, model, eps=16 / 255, iterations=10, mu=1.0,
             x_adv.grad.zero_()
         loss.backward()
 
-        # === 按文档：计算 N 副本平均梯度，再做 L1 归一化并进入动量 ===
         grad = x_adv.grad.data
-        # 当存在 admix 时，x_transformed 会扩展 batch；但 x_adv 仍是原 batch，梯度 shape 不变。
-        # 所以这里的 grad 就是对“期望损失”（通过 cat 的前向）求得的梯度。
-        g_bar = grad  # 已经等价于对随机变换族的 Monte-Carlo 估计梯度
-        l1 = torch.mean(torch.abs(g_bar), dim=(1, 2, 3), keepdim=True) + 1e-8
-        g_bar = g_bar / l1
+        l1 = torch.mean(torch.abs(grad), dim=(1, 2, 3), keepdim=True) + 1e-8
+        grad = grad / l1
 
-        momentum = mu * momentum + g_bar
+        momentum = mu * momentum + grad
 
-        # 更新对抗样本
         with torch.no_grad():
             x_adv = x_adv + alpha * torch.sign(momentum)
             delta = torch.clamp(x_adv - x, -eps, eps)
@@ -472,8 +549,8 @@ def main():
     model_repo = ModelRepository(device)
 
     # --- 1. 攻击阶段：在内存中生成 ---
-    source_model = load_source_model(args.model, device)
-
+    source_model_info = model_repo.get_source_model(args.model)
+    source_model = source_model_info['model']
     label_csv_path = os.path.join(args.input_dir, 'labels.csv')
     img_root = os.path.join(args.input_dir, 'images')
     label_df = pd.read_csv(label_csv_path)
@@ -496,37 +573,41 @@ def main():
     print(f"\n[Step 1/3] Attacking in Memory...")
 
     for x_batch, y_batch, filename_batch in tqdm(loader, desc="Attacking"):
-        x_batch, y_batch = x_batch.to(device), y_batch.to(device)
+        x_batch = x_batch.to(device)
+        y_batch = (y_batch+1).to(device)
 
-        # 记录原始预测
         source_orig_preds = get_model_prediction(source_model, x_batch)
 
-        # 生成对抗样本
-        x_adv_batch = mifgsm_attack_BSR(x_batch, y_batch, source_model,
-                                        iterations=args.iterations,
-                                        mu=args.mu, num_blocks_h=args.num_blocks_h,
-                                        num_blocks_w=args.num_blocks_w,
-                                        max_angle=args.max_angle,
-                                        num_copies=args.num_copies,
-                                        use_diversity=args.use_diversity,
-                                        use_admix=args.use_admix,
-                                        portion=args.portion,
-                                        admix_size=args.admix_size,
-                                        diversity_prob=args.diversity_prob,
-                                        p_swap=args.p_swap,
-                                        distortion_scale=args.distortion_scale)
+        x_adv_batch = mifgsm_attack_BSR(
+            x_batch,
+            y_batch,
+            source_model,
+            eps=args.eps,
+            iterations=args.iterations,
+            mu=args.mu,
+            num_blocks_h=args.num_blocks_h,
+            num_blocks_w=args.num_blocks_w,
+            max_angle=args.max_angle,
+            num_copies=args.num_copies,
+            use_diversity=args.use_diversity,
+            use_admix=args.use_admix,
+            portion=args.portion,
+            admix_size=args.admix_size,
+            diversity_prob=args.diversity_prob,
+            p_swap=args.p_swap,
+            distortion_scale=args.distortion_scale,
+            bsr=args.bsr,
+        )
 
-        # 记录攻击后预测
         source_adv_preds = get_model_prediction(source_model, x_adv_batch)
 
-        # 将生成的对抗样本移至 CPU 并存储，释放显存
         adv_images_storage.append(x_adv_batch.cpu())
 
         for i in range(x_adv_batch.size(0)):
-            true_label = int(y_batch[i].item()) + 1
-            s_adv_idx = int(source_adv_preds[i]) + 1
-            s_orig_idx = int(source_orig_preds[i]) + 1
-            # print(f"{s_orig_idx}\t{s_adv_idx}\t{true_label}")
+            true_label = int(y_batch[i].item())
+            s_adv_idx = int(source_adv_preds[i])
+            s_orig_idx = int(source_orig_preds[i])
+            # print(true_label, s_adv_idx)
             source_results.append({
                 "filename": filename_batch[i],
                 "true_label": true_label,
@@ -553,9 +634,9 @@ def main():
 
     for model_name in target_names:
         print(f"  --> Testing target model: {model_name}")
-        # 这里建议你根据之前讨论的，实现一个 load_single_model 或者 load_source_model
+
         # 假设这里依然通过 repo 加载
-        current_model_info = model_repo.load_single_model(model_name)
+        current_model_info = model_repo.get_source_model(model_name)
         model = current_model_info['model']
         model.eval()
 

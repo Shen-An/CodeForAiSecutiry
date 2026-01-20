@@ -2,6 +2,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
+from tqdm import tqdm
+
 from models import *
 
 def input_diversity(x, prob=0.5):
@@ -225,7 +227,7 @@ def main():
     
     for idx, row in tqdm(label_df.iterrows(),total=len(label_df)):
         img_filename = row["filename"]
-        true_label = int(row["label"])
+        true_label = int(row["label"])+1
         img_path = os.path.join('./data/images', img_filename)
         
         # print(f"\nProcessing image {idx+1}/{len(label_df)}: {img_filename}")
@@ -246,7 +248,7 @@ def main():
             
             # 测试对抗样本在目标模型上的效果
             target_pred = get_model_prediction(target_model, result['adv_image'])
-            
+            print(target_pred,true_label)
             target_results[model_name] = {
                 "prediction": target_pred,
                 "fooled": target_pred != true_label
