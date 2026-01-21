@@ -4,6 +4,7 @@ import torch
 from tqdm import tqdm
 import pandas as pd
 import torchvision.transforms as transforms
+from torch.utils.data import TensorDataset, DataLoader
 
 def get_model_prediction(model, x):
     output = model(x)
@@ -22,13 +23,6 @@ def get_model_prediction(model, x):
     return output
 
 
-import torch
-import gc
-import os
-import pandas as pd
-from tqdm import tqdm
-from torch.utils.data import TensorDataset, DataLoader
-from torchvision.utils import save_image
 
 
 def eval_transferability(source_results, adv_images_storage, args, model_repo, device):
