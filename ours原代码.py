@@ -65,8 +65,8 @@ def get_block_lengths_bsr(length, num_blocks):
 def parse_args():
     parser = argparse.ArgumentParser(description="BSR attack")
     parser.add_argument("--model", default='tf2torch_inception_v3', type=str, help="source model")
-    parser.add_argument('--output_adv_dir', default='./results/BSR/images', type=str, help='adv images dir')
-    parser.add_argument('--output_csv', default='./results/BSR/results.csv', type=str, help='output CSV path')
+    parser.add_argument('--output_adv_dir', default='./results/PPSP/images', type=str, help='adv images dir')
+    parser.add_argument('--output_csv', default='./results/PPSP/results.csv', type=str, help='output CSV path')
     parser.add_argument('--input_dir', default='./data', type=str)
     parser.add_argument('--batchsize', default=2, type=int)
     parser.add_argument('--eps', default=16 / 255.0, type=float)
@@ -98,14 +98,14 @@ def parse_args():
 
     # Adjacent-Swap + Perspective params
     parser.add_argument("--p_swap", default=0.5, type=float, help="adjacent swap probability")
-    parser.add_argument("--distortion_scale", default=0.06, type=float, help="perspective distortion scale (BCTOT D)")
+    parser.add_argument("--distortion_scale", default=0.2, type=float, help="perspective distortion scale (BCTOT D)")
 
     # 保存第 N 次迭代的中间副本/变换图
     # 约定：save_iter<=0 视为关闭；>0 则在该迭代保存
     # 为了兼容旧用法，保留 --save_iter5，但默认不需要它
     parser.add_argument('--save_iter5', action='store_true', help='(deprecated) enable save_iter (kept for compatibility)')
     parser.add_argument('--save_iter', default=0, type=int, help='which iteration to dump (1-based); <=0 disables')
-    parser.add_argument('--save_trans_dir', default='./results/BSR/trans_debug', type=str, help='dir to save intermediate transformed images')
+    parser.add_argument('--save_trans_dir', default='./results/PPSP/trans_debug', type=str, help='dir to save intermediate transformed images')
 
     # 调试：只跑一个 batch，跑完就退出（通常配合 --save_iter 1）
     parser.add_argument('--one_batch', action='store_true', help='debug: only attack the first batch and exit after saving')
@@ -666,6 +666,18 @@ def main():
     orig_dataset = AdvPNGDataset(img_root, label_df, transform)
     loader = DataLoader(orig_dataset, batch_size=args.batchsize, shuffle=False)
 
+    # # --------------------- 测试新增代码开始 ---------------------
+    # # 替换成你要运行的两张图片的文件名
+    TARGET_IMAGES = ["ILSVRC2012_val_00000470.png", "ILSVRC2012_val_00000356.png"]
+    # 筛选数据集
+    orig_dataset = filter_dataset_by_filenames(orig_dataset, TARGET_IMAGES)
+    # 确保 batch_size 不大于筛选后的样本数
+    args.batchsize = min(args.batchsize, len(orig_dataset))
+    # --------------------- 新增代码结束 ---------------------
+
+    # 后续的 DataLoader 初始化不变
+    loader = DataLoader(orig_dataset, batch_size=args.batchsize, shuffle=False)
+
     source_results = []
     adv_images_storage = []  # 用于暂存对抗样本 (CPU Tensor)
 
@@ -801,7 +813,42 @@ def main():
     pd.DataFrame(final_rows).to_csv(args.output_csv, index=False)
     print(f"\nDetailed results saved to {args.output_csv}")
 
+# 测试batch图片
+def filter_dataset_by_filenames(dataset: AdvPNGDataset, target_filenames: List[str]) -> AdvPNGDataset:
+    """
+    筛选 AdvPNGDataset，只保留指定文件名的样本
+    适配你的 AdvPNGDataset 类（修复 img_root/img_dir 不匹配、缺少 img_paths 的问题）
+    Args:
+        dataset: 原始 AdvPNGDataset 数据集
+        target_filenames: 需要保留的图片文件名列表（如 ["img_001.png", "img_002.png"]）
+    Returns:
+        筛选后的 AdvPNGDataset
+    """
+    # 1. 构建文件名到样本索引的映射（从label_df中读取文件名）
+    filename_to_idx = {}
+    for idx in range(len(dataset.label_df)):
+        fn = dataset.label_df.iloc[idx]['filename']
+        filename_to_idx[fn] = idx
 
+    # 2. 筛选出目标文件名对应的索引
+    target_indices = []
+    for fn in target_filenames:
+        if fn in filename_to_idx:
+            target_indices.append(filename_to_idx[fn])
+        else:
+            print(f"Warning: {fn} not found in dataset, skipped")
+
+    # 3. 若没有匹配的文件，抛出友好提示（避免后续空数据集报错）
+    if not target_indices:
+        raise ValueError("No target images found in dataset! Please check your filenames.")
+
+    # 4. 构造筛选后的数据集（适配你的 AdvPNGDataset 初始化参数）
+    filtered_dataset = AdvPNGDataset(
+        img_dir=dataset.img_dir,  # 修复：用 img_dir 而非 img_root
+        label_df=dataset.label_df.iloc[target_indices].reset_index(drop=True),
+        transform=dataset.transform
+    )
+    return filtered_dataset
 if __name__ == '__main__':
     # 清空CUDA缓存
     torch.cuda.empty_cache()
