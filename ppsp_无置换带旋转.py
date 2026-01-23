@@ -75,7 +75,6 @@ def parse_args():
     parser.add_argument('--diversity_prob', default=0.5, type=float, help='input diversity probability')
     parser.add_argument("--num_blocks_h", default=2, type=int, help="number of blocks h")
     parser.add_argument("--num_blocks_w", default=2, type=int, help="number of blocks w")
-    parser.add_argument("--max_angle", default=0.2, type=int, help="maximum angle")
     parser.add_argument("--num_copies", default=20, type=int, help="number of copies")
 
     # NOTE: argparse 的 type=bool 不可靠（传入字符串 'False' 也会变 True），改用 store_true/store_false
@@ -91,14 +90,18 @@ def parse_args():
     parser.add_argument("--admix_size", default=3, type=int, help="admix size")
 
     # 你要的单参数开关：
-    #   --bsr      => True, 使用 BSR（当前实现：相邻置换 + 透视 + 旋转）
-    #   不加参数   => False, 不使用 BSR，改为“直接 透视 + 置换”（无旋转）
-    parser.add_argument('--bsr', action='store_true', help='use BSR (AS+perspective+rotation)')
+    #   --bsr      => True, 使用 BSR（当前实现：随机置换 + 透视 + 旋转）
+    #   不加参数   => False, 默认分块透视 + 分块旋转（无相邻置换）
+    parser.add_argument('--bsr', action='store_true', help='use BSR (permute+perspective+rotation)')
     parser.set_defaults(bsr=False)
 
+    # 旋转角度拆分：BSR 与默认透视分块使用不同 max_angle，便于组件化开关
+    parser.add_argument("--max_angle_bsr", default=0.2, type=float, help="maximum rotation angle for BSR")
+    parser.add_argument("--max_angle_default", default=0.2, type=float, help="maximum rotation angle for default (non-BSR)")
+
     # Adjacent-Swap + Perspective params
-    parser.add_argument("--p_swap", default=0.5, type=float, help="adjacent swap probability")
-    parser.add_argument("--distortion_scale", default=0.06, type=float, help="perspective distortion scale (BCTOT D)")
+    # p_swap 已不再使用（不做相邻置换/概率置换），因此移除
+    parser.add_argument("--distortion_scale", default=0.26, type=float, help="perspective distortion scale (BCTOT D)")
 
     # 保存第 N 次迭代的中间副本/变换图
     # 约定：save_iter<=0 视为关闭；>0 则在该迭代保存
@@ -116,63 +119,21 @@ def parse_args():
 
 @dataclass(frozen=True)
 class BSPPParams:
-    """单次 BSPP 变换的参数集合。
+    """（保留占位）单次变换参数集合。
 
-    - width_length/height_length: 固定分块长度（保证同一次迭代内多处使用一致）
-    - swapped_width_length/swapped_height_length: 相邻置换后的长度序列
+    旧版用于相邻置换的长度参数已移除；当前仅保留以兼容历史接口。
     """
 
     width_length: Tuple[int, ...]
     height_length: Tuple[int, ...]
-    swapped_width_length: Tuple[int, ...]
-    swapped_height_length: Tuple[int, ...]
 
 
-def _build_block_index_map(num_blocks_h: int, num_blocks_w: int):
-    """把二维(i,j)映射到一维idx，以及反向映射。"""
-    def to_idx(i: int, j: int) -> int:
-        return i * num_blocks_w + j
-
-    def from_idx(idx: int) -> Tuple[int, int]:
-        return idx // num_blocks_w, idx % num_blocks_w
-
-    return to_idx, from_idx
-
-
-def _swap_adjacent_in_lengths(lengths: Tuple[int, ...], p_swap: float) -> Tuple[int, ...]:
-    """在长度序列中，以概率 p_swap 选择一对相邻元素进行对调。
-
-    对应文档的 T_AS：在 L_h 或 L_w 上做相邻置换，而不是直接交换块Tensor。
-    这样重建时的拼接尺寸天然一致，不会出现 cat 维度不匹配。
-    """
-    if len(lengths) <= 1:
-        return lengths
-
-    out = list(lengths)
-    # 单次应用：随机选一个相邻对；若未命中概率则不交换
-    if np.random.rand() < p_swap:
-        j = np.random.randint(0, len(out) - 1)
-        out[j], out[j + 1] = out[j + 1], out[j]
-    return tuple(int(x) for x in out)
-
-
-def generate_bspp_params(width: int, height: int, num_blocks_h: int, num_blocks_w: int, p_swap: float = 0.3) -> BSPPParams:
-    """生成一次 BSPP 变换所需的参数。"""
-    width_length = get_block_lengths_bsr(width, num_blocks_h)
-    height_length = get_block_lengths_bsr(height, num_blocks_w)
-    # 选项1：每次只在一个方向做相邻交换（避免二维同时交换带来的尺寸重映射复杂性）
-    if np.random.rand() < 0.5:
-        swapped_width_length = _swap_adjacent_in_lengths(width_length, p_swap=p_swap)
-        swapped_height_length = height_length
-    else:
-        swapped_width_length = width_length
-        swapped_height_length = _swap_adjacent_in_lengths(height_length, p_swap=p_swap)
-    return BSPPParams(
-        width_length=width_length,
-        height_length=height_length,
-        swapped_width_length=swapped_width_length,
-        swapped_height_length=swapped_height_length,
-    )
+# === 相邻置换相关实现已彻底移除（不再使用） ===
+# _build_block_index_map
+# _swap_adjacent_in_lengths
+# generate_bspp_params
+# _perm_from_adjacent_swap
+# _adjacent_swap_reconstruct
 
 
 def _split_blocks(x: torch.Tensor, width_length: Tuple[int, ...], height_length: Tuple[int, ...]):
@@ -188,62 +149,6 @@ def _merge_blocks(blocks):
     """把二维块列表 blocks[i][j] 拼回 (B,C,W,H)。"""
     strips = [torch.cat(row, dim=3) for row in blocks]
     return torch.cat(strips, dim=2)
-
-
-def _perm_from_adjacent_swap(orig: Tuple[int, ...], swapped: Tuple[int, ...]) -> Optional[Tuple[int, int]]:
-    """若 swapped 是通过对 orig 做一次相邻交换得到的，返回被交换的一对索引(j, j+1)。
-
-    若没有发生交换（或不符合一次相邻交换的形式），返回 None。
-    """
-    if orig == swapped:
-        return None
-    if len(orig) != len(swapped):
-        return None
-    diffs = [k for k in range(len(orig)) if orig[k] != swapped[k]]
-    if len(diffs) != 2:
-        return None
-    a, b = diffs
-    if b != a + 1:
-        return None
-    if orig[a] == swapped[b] and orig[b] == swapped[a]:
-        return (a, b)
-    return None
-
-
-def _adjacent_swap_reconstruct(x: torch.Tensor,
-                               width_length: Tuple[int, ...],
-                               height_length: Tuple[int, ...],
-                               swapped_width_length: Tuple[int, ...],
-                               swapped_height_length: Tuple[int, ...]) -> torch.Tensor:
-    """按文档的 T_AS（选项1）实现“内容映射”，不做 crop/pad。
-
-    约束：每次仅在 L_w 或 L_h 中发生一次相邻交换。
-
-    实现方式：
-    - 若 L_w 发生交换：在 dim=2 切出的条带列表上交换对应条带；条带内再按 height_length 切块。
-    - 若 L_h 发生交换：在 dim=3 切出的条带列表上交换对应条带；再按 width_length 切条带。
-    """
-    w_swap = _perm_from_adjacent_swap(width_length, swapped_width_length)
-    h_swap = _perm_from_adjacent_swap(height_length, swapped_height_length)
-
-    # 选项1下应该最多一个方向发生交换
-    if w_swap is not None and h_swap is not None:
-        # 防御性：若意外同时交换，退化为不交换（避免语义/尺寸异常）
-        return x
-
-    if w_swap is not None:
-        j0, j1 = w_swap
-        strips = list(torch.split(x, width_length, dim=2))
-        strips[j0], strips[j1] = strips[j1], strips[j0]
-        return torch.cat(strips, dim=2)
-
-    if h_swap is not None:
-        j0, j1 = h_swap
-        strips = list(torch.split(x, height_length, dim=3))
-        strips[j0], strips[j1] = strips[j1], strips[j0]
-        return torch.cat(strips, dim=3)
-
-    return x
 
 
 def _rand_perspective_params(block_h: int, block_w: int, distortion_scale: float, device):
@@ -341,42 +246,43 @@ def _warp_perspective_grid_sample(block: torch.Tensor, H: torch.Tensor) -> torch
 
 def shuffle_rotate_bsr(x, num_blocks_h=2, num_blocks_w=2, max_angle=0.2, *,
                        distortion_scale: float = 0.06,
-                       p_swap: float = 0.3,
                        params: Optional[BSPPParams] = None):
     """PPSP.
 
-    T_BSPP = R ∘ T_persp ∘ T_AS
+    BSR 置换逻辑：宽/高方向分别做随机置换（完全打乱），然后对每个块做透视 + 旋转。
 
-    - T_AS: 相邻块互换（保持拓扑连续性，避免全局shuffle的语义破坏）
-    - T_persp: 对每个块做随机透视（δ = distortion_scale * block_dim）
-    - R: 对每个块做小角度随机旋转
-
-    说明：
-    - 使用 params 时保证一次迭代内变换复用同一组分块/交换对。
+    注意：
+    - 仅包含置换 + 透视 + 旋转；不包含任何相邻置换概率参数。
+    - params 保留为兼容外部调用签名（当前未使用）。
     """
     batch_size, channels, w, h = x.shape
 
-    if params is None:
-        params = generate_bspp_params(w, h, num_blocks_h, num_blocks_w, p_swap=p_swap)
+    # 获取分块长度（与原实现一致：随机长度分块）
+    width_length = get_block_lengths_bsr(w, num_blocks_h)
+    height_length = get_block_lengths_bsr(h, num_blocks_w)
 
-    # 1) Adjacent Swap on lengths (T_AS)
-    x_swapped = _adjacent_swap_reconstruct(
-        x,
-        params.width_length,
-        params.height_length,
-        params.swapped_width_length,
-        params.swapped_height_length,
-    )
+    # === 置换：替换为 notebook 版本（宽/高分别随机置换） ===
+    width_perm = np.random.permutation(np.arange(num_blocks_h))
+    height_perm = np.random.permutation(np.arange(num_blocks_w))
 
-    # 交换后张量尺寸不变；切块仍使用 swapped 版本长度（与“被交换后的区域定义”一致）
-    blocks = _split_blocks(x_swapped, params.swapped_width_length, params.swapped_height_length)
+    # 宽度方向分块并按 width_perm 重新排列
+    x_split_w = torch.split(x, width_length, dim=2)
+    x_w_perm = torch.cat([x_split_w[i] for i in width_perm], dim=2)
 
-    # 2) Perspective + 3) Rotation (per-block)
-    for i in range(num_blocks_h):
-        for j in range(num_blocks_w):
-            block = blocks[i][j]
+    # 在 x_w_perm 上按高度分块（保持与 notebook 行为一致：每个 strip 内再切 h 块）
+    x_split_h_blocks = []
+    for w_block in torch.split(x_w_perm, width_length, dim=2):
+        h_blocks = torch.split(w_block, height_length, dim=3)
+        x_split_h_blocks.append(h_blocks)
+
+    # 透视 + 旋转（保持原实现），并按 height_perm 重排每个 strip 的 h 块
+    rotated_blocks = []
+    for strip in x_split_h_blocks:
+        rotated_strip = []
+        for block in strip:
             bH, bW = block.shape[2], block.shape[3]
             if bH <= 1 or bW <= 1:
+                rotated_strip.append(block)
                 continue
 
             out_block = block.clone()
@@ -385,12 +291,12 @@ def shuffle_rotate_bsr(x, num_blocks_h=2, num_blocks_w=2, max_angle=0.2, *,
             for bi in range(batch_size):
                 single = block[bi:bi + 1]
 
-                # perspective
+                # perspective（原实现）
                 src_n, dst_n = _rand_perspective_params(bH, bW, distortion_scale, device=x.device)
                 H_mat = _homography_dlt(src_n, dst_n)
                 single = _warp_perspective_grid_sample(single, H_mat)
 
-                # rotation
+                # rotation（原实现）
                 angle = angles[bi]
                 angle_matrix = torch.tensor(
                     [[math.cos(angle), -math.sin(angle), 0], [math.sin(angle), math.cos(angle), 0]],
@@ -402,25 +308,26 @@ def shuffle_rotate_bsr(x, num_blocks_h=2, num_blocks_w=2, max_angle=0.2, *,
 
                 out_block[bi:bi + 1] = single
 
-            blocks[i][j] = out_block
+            rotated_strip.append(out_block)
 
-    return _merge_blocks(blocks)
+        rotated_strip_perm = [rotated_strip[i] for i in height_perm]
+        rotated_blocks.append(torch.cat(rotated_strip_perm, dim=3))
+
+    x_h_perm = torch.cat(rotated_blocks, dim=2)
+    return x_h_perm
 
 
 def BSR_transform(x, num_blocks_h=2, num_blocks_w=2, max_angle=0.2, num_copies=20, *,
-                  distortion_scale: float = 0.06,
-                  p_swap: float = 0.3):
+                  distortion_scale: float = 0.06):
     """BSR变换：创建多个分块旋转打乱的副本"""
     transformed_copies = []
     for _ in range(num_copies):
-        # 每个副本独立采样 params，形成随机算子族以估计期望梯度
         transformed_copy = shuffle_rotate_bsr(
             x,
             num_blocks_h,
             num_blocks_w,
             max_angle,
             distortion_scale=distortion_scale,
-            p_swap=p_swap,
         )
         transformed_copies.append(transformed_copy)
 
@@ -433,27 +340,27 @@ def _perspective_permutation_transform(
     num_blocks_h: int,
     num_blocks_w: int,
     num_copies: int,
-    p_swap: float,
     distortion_scale: float,
+    max_angle: float,
 ) -> torch.Tensor:
-    """不使用 BSR 时：只做『相邻置换 + 透视』(不做旋转)，复制 num_copies 次。"""
+    """不使用 BSR 时：只做『分块透视 + 分块旋转』（不做相邻置换），复制 num_copies 次。
+
+    说明：
+    - 这里的默认路径不再进行分块相邻置换（T_AS）。
+    - 旋转与 BSR 中保持一致：对每个块做小角度随机旋转。
+    """
     copies = []
     B, C, w, h = x.shape
 
+    # 分块长度每个副本可独立采样（与 BSR 一致形成随机算子族）
     for _ in range(num_copies):
-        params = generate_bspp_params(w, h, num_blocks_h, num_blocks_w, p_swap=p_swap)
+        width_length = get_block_lengths_bsr(w, num_blocks_h)
+        height_length = get_block_lengths_bsr(h, num_blocks_w)
 
-        # 1) T_AS（只做相邻置换，保持尺寸不变）
-        x_swapped = _adjacent_swap_reconstruct(
-            x,
-            params.width_length,
-            params.height_length,
-            params.swapped_width_length,
-            params.swapped_height_length,
-        )
+        # 1) split blocks（不做相邻置换）
+        blocks = _split_blocks(x, width_length, height_length)
 
-        # 2) per-block perspective（不做 rotation）
-        blocks = _split_blocks(x_swapped, params.swapped_width_length, params.swapped_height_length)
+        # 2) per-block perspective + rotation
         for i in range(num_blocks_h):
             for j in range(num_blocks_w):
                 block = blocks[i][j]
@@ -462,11 +369,26 @@ def _perspective_permutation_transform(
                     continue
 
                 out_block = block.clone()
+                angles = torch.clamp(torch.randn(B, device=x.device) * 0.05, -max_angle, max_angle)
+
                 for bi in range(B):
                     single = block[bi:bi + 1]
+
+                    # perspective
                     src_n, dst_n = _rand_perspective_params(bH, bW, distortion_scale, device=x.device)
                     H_mat = _homography_dlt(src_n, dst_n)
                     single = _warp_perspective_grid_sample(single, H_mat)
+
+                    # rotation
+                    angle = angles[bi]
+                    angle_matrix = torch.tensor(
+                        [[math.cos(angle), -math.sin(angle), 0], [math.sin(angle), math.cos(angle), 0]],
+                        dtype=torch.float32,
+                        device=x.device,
+                    ).unsqueeze(0)
+                    grid = F.affine_grid(angle_matrix, single.size(), align_corners=False)
+                    single = F.grid_sample(single, grid, mode='bilinear', padding_mode='zeros', align_corners=False)
+
                     out_block[bi:bi + 1] = single
 
                 blocks[i][j] = out_block
@@ -529,14 +451,19 @@ def _save_trans_images(
 
 
 def mifgsm_attack_ppsp(x, y, model, eps=16 / 255, iterations=10, mu=1.0,
-                      num_blocks_h=2, num_blocks_w=2, max_angle=0.2,
+                      num_blocks_h=2, num_blocks_w=2, *,
+                      max_angle_bsr=0.2,
+                      max_angle_default=0.2,
                       num_copies=20, use_diversity=True, use_admix=False,
                       portion=0.2, admix_size=3, diversity_prob=0.5,
-                      p_swap=0.3, distortion_scale=0.06, *, bsr: bool = False,
+                      distortion_scale=0.06, bsr: bool = False,
                       save_iter: int | None = None,
                       save_trans_dir: str | None = None,
                       filenames: Optional[list[str]] = None):
-    """MI-FGSM + (BSR 或 透视+置换)。
+    """MI-FGSM + (BSR 或 默认分块透视+旋转)。
+
+    - bsr=True:  BSR 路径（置换 + 分块透视 + 分块旋转），旋转角度由 max_angle_bsr 控制
+    - bsr=False: 默认分块透视 + 分块旋转（不做相邻置换），旋转角度由 max_angle_default 控制
 
     save_iter: 若给定(1-based)，则在该次迭代保存 x_aug 的所有 num_copies 变换副本。
     """
@@ -577,10 +504,9 @@ def mifgsm_attack_ppsp(x, y, model, eps=16 / 255, iterations=10, mu=1.0,
                 x_transformed,
                 num_blocks_h,
                 num_blocks_w,
-                max_angle,
+                max_angle_bsr,
                 num_copies,
                 distortion_scale=distortion_scale,
-                p_swap=p_swap,
             )
         else:
             x_aug = _perspective_permutation_transform(
@@ -588,8 +514,8 @@ def mifgsm_attack_ppsp(x, y, model, eps=16 / 255, iterations=10, mu=1.0,
                 num_blocks_h=num_blocks_h,
                 num_blocks_w=num_blocks_w,
                 num_copies=num_copies,
-                p_swap=p_swap,
                 distortion_scale=distortion_scale,
+                max_angle=max_angle_default,
             )
 
         # dump intermediate transformed copies at iteration save_iter
@@ -691,14 +617,14 @@ def main():
             mu=args.mu,
             num_blocks_h=args.num_blocks_h,
             num_blocks_w=args.num_blocks_w,
-            max_angle=args.max_angle,
+            max_angle_bsr=args.max_angle_bsr,
+            max_angle_default=args.max_angle_default,
             num_copies=args.num_copies,
             use_diversity=args.use_diversity,
             use_admix=args.use_admix,
             portion=args.portion,
             admix_size=args.admix_size,
             diversity_prob=args.diversity_prob,
-            p_swap=args.p_swap,
             distortion_scale=args.distortion_scale,
             bsr=args.bsr,
             save_iter=(args.save_iter if args.save_iter > 0 else (5 if args.save_iter5 else None)),
