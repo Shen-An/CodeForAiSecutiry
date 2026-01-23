@@ -69,7 +69,7 @@ class GradCAM:
 def get_inception_v3_torch():
     """获取本地InceptionV3模型（torch版本）"""
     model = models.inception_v3(pretrained=False)
-    state_dict = torch.load(r"../models/inception_v3_google-0cc3c7bd.pth")
+    state_dict = torch.load(r"./models/inception_v3_google-0cc3c7bd.pth")
     model.load_state_dict(state_dict)
     model.eval()
     # InceptionV3的Mixed_7c层
@@ -80,7 +80,7 @@ def get_inception_v3_torch():
 def get_inception_v4():
     """获取本地InceptionV4模型"""
     model = timm.create_model('inception_v4', pretrained=False)
-    state_dict = torch.load(r"../models/inceptionV4.bin")
+    state_dict = torch.load(r"./models/inceptionV4.bin")
     model.load_state_dict(state_dict)
     model.eval()
 
@@ -110,7 +110,7 @@ def get_inception_v4():
 def get_inception_resnet_v2():
     """获取本地Inception-ResNetV2模型"""
     model = timm.create_model('inception_resnet_v2', pretrained=False)
-    state_dict = torch.load(r"../models/incep_resnet_V2.bin")
+    state_dict = torch.load(r"./models/incep_resnet_V2.bin")
     model.load_state_dict(state_dict)
     model.eval()
 
@@ -134,7 +134,7 @@ def get_inception_resnet_v2():
 def get_resnet101():
     """获取本地ResNet101模型"""
     model = models.resnet101(pretrained=False)
-    state_dict = torch.load(r"../models/resnet101-63fe2227.pth")
+    state_dict = torch.load(r"./models/resnet101-63fe2227.pth")
     model.load_state_dict(state_dict)
     model.eval()
     # ResNet101的layer4的最后一个卷积层
@@ -145,7 +145,7 @@ def get_resnet101():
 def get_densenet121():
     """获取本地DenseNet121模型"""
     model = timm.create_model('densenet121', pretrained=False)
-    state_dict = torch.load(r"../models/densenet121.bin")
+    state_dict = torch.load(r"./models/densenet121.bin")
     model.load_state_dict(state_dict)
     model.eval()
 
@@ -169,7 +169,7 @@ def get_densenet121():
 def get_adv_inception_v3():
     """获取本地Adversarial InceptionV3模型"""
     model = timm.create_model('inception_v3', pretrained=False)
-    state_dict = torch.load(r"../models/adv_inceptionV3.bin")
+    state_dict = torch.load(r"./models/adv_inceptionV3.bin")
     model.load_state_dict(state_dict)
     model.eval()
 
@@ -321,7 +321,7 @@ def get_filename_from_label(class_idx):
 
     if IMAGENET_LABELS is None:
         try:
-            IMAGENET_LABELS = load_imagenet_labels(r"../data/labels.csv")
+            IMAGENET_LABELS = load_imagenet_labels(r"./data/labels.csv")
         except Exception as e:
             print(f"加载标签文件失败: {e}")
             IMAGENET_LABELS = {}
@@ -459,8 +459,8 @@ def main(image_path):
 
 if __name__ == "__main__":
     # 使用示例图像
-    image_path = r"./data/adv/adv_ILSVRC2012_val_00001148.jpg"
+    image_path = r"E:\TransferAttack\RuiGuoCode\results\dim\images\ILSVRC2012_val_00000356.png"
     # image_path=r'D:\pycharm\python\Adversial\work_now\PMRT\transform_images_PHFRT\transformed_image.jpg'
-    # image_path = r"../ours/adv_images/ILSVRC2012_val_00001148.png"
+    # image_path = r"data/images/ILSVRC2012_val_00000356.png"
     # 运行完整版本
     results = main(image_path)

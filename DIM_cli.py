@@ -13,6 +13,8 @@ from torchvision import transforms
 from models import ModelRepository, Normalize
 from torch.utils.data import DataLoader, Dataset, TensorDataset
 
+from ours原代码 import filter_dataset_by_filenames
+
 
 # --- 自定义数据集：从本地加载生成的 PNG 对抗样本 ---
 class AdvPNGDataset(Dataset):
@@ -227,6 +229,17 @@ def main():
     orig_dataset = AdvPNGDataset(img_root, label_df, transform)
     loader = DataLoader(orig_dataset, batch_size=args.batchsize, shuffle=False)
 
+    # # --------------------- 测试新增代码开始 ---------------------
+    # # # 替换成你要运行的两张图片的文件名
+    # TARGET_IMAGES = ["ILSVRC2012_val_00000470.png", "ILSVRC2012_val_00000356.png"]
+    # # 筛选数据集
+    # orig_dataset = filter_dataset_by_filenames(orig_dataset, TARGET_IMAGES)
+    # # 确保 batch_size 不大于筛选后的样本数
+    # args.batchsize = min(args.batchsize, len(orig_dataset))
+    # # --------------------- 新增代码结束 ---------------------
+    #
+    # # 后续的 DataLoader 初始化不变
+    # loader = DataLoader(orig_dataset, batch_size=args.batchsize, shuffle=False)
     source_results = []
     adv_images_storage = []
 
@@ -274,7 +287,7 @@ def main():
 
     for model_name in target_names:
         print(f"  --> Testing target model: {model_name}")
-        current_model_info = model_repo.load_single_model(model_name)
+        current_model_info = model_repo.get_source_model(model_name)
         model = current_model_info['model']
         model.eval()
 
@@ -333,6 +346,7 @@ def main():
     os.makedirs(os.path.dirname(args.output_csv), exist_ok=True)
     pd.DataFrame(final_rows).to_csv(args.output_csv, index=False)
     print(f"\nDetailed results saved to {args.output_csv}")
+
 
 
 if __name__ == '__main__':

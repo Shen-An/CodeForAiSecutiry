@@ -89,15 +89,15 @@ def parse_args():
     parser.add_argument("--portion", default=0.2, type=float, help="portion admix")
     parser.add_argument("--admix_size", default=3, type=int, help="admix size")
 
-    #参数开关：
+    # 你要的单参数开关：
     #   --bsr      => True, 使用 BSR（当前实现：随机置换 + 透视 + 旋转）
-    #   不加参数   => False, 默认分块透视 + 分块旋转
+    #   不加参数   => False, 默认分块透视 + 分块旋转（无相邻置换）
     parser.add_argument('--bsr', action='store_true', help='use BSR (permute+perspective+rotation)')
     parser.set_defaults(bsr=False)
 
     # 旋转角度拆分：BSR 与默认透视分块使用不同 max_angle，便于组件化开关
     parser.add_argument("--max_angle_bsr", default=0.2, type=float, help="maximum rotation angle for BSR")
-    parser.add_argument("--max_angle_default", default=1.2, type=float, help="maximum rotation angle for default (non-BSR)")
+    parser.add_argument("--max_angle_default", default=1.6, type=float, help="maximum rotation angle for default (non-BSR)")
 
     # Adjacent-Swap + Perspective params
     # p_swap 已不再使用（不做相邻置换/概率置换），因此移除
@@ -113,9 +113,6 @@ def parse_args():
     # 调试：只跑一个 batch，跑完就退出（通常配合 --save_iter 1）
     parser.add_argument('--one_batch', action='store_true', help='debug: only attack the first batch and exit after saving')
     parser.set_defaults(one_batch=False)
-
-    # 水平翻转
-    parser.add_argument('--flip_prob', default=0.4, type=float, help='probability to apply random horizontal flip before block transforms')
 
     return parser.parse_args()
 
@@ -459,7 +456,6 @@ def mifgsm_attack_ppsp(x, y, model, eps=16 / 255, iterations=10, mu=1.0,
                       max_angle_default=0.2,
                       num_copies=20, use_diversity=True, use_admix=False,
                       portion=0.2, admix_size=3, diversity_prob=0.5,
-                      flip_prob: float = 0.4,
                       distortion_scale=0.06, bsr: bool = False,
                       save_iter: int | None = None,
                       save_trans_dir: str | None = None,
@@ -481,11 +477,6 @@ def mifgsm_attack_ppsp(x, y, model, eps=16 / 255, iterations=10, mu=1.0,
             x_transformed = input_diversity(x_adv, prob=diversity_prob)
         else:
             x_transformed = x_adv
-
-        # 水平翻转：在进入 BSR/默认分块变换前按概率执行
-        if flip_prob > 0.0 and torch.rand(1, device=x_transformed.device).item() < flip_prob:
-            # x: (B,C,W,H) 这里 H 维在 dim=3，对其做翻转实现水平翻转
-            x_transformed = torch.flip(x_transformed, dims=[3])
 
         if use_admix:
             x_transformed = admix(x_transformed, portion=portion, size=admix_size)
@@ -604,6 +595,17 @@ def main():
     ])
 
     orig_dataset = AdvPNGDataset(img_root, label_df, transform)
+
+    # # --------------------- 测试新增代码开始 ---------------------
+    # # 替换成你要运行的两张图片的文件名
+    TARGET_IMAGES = ["ILSVRC2012_val_00000470.png", "ILSVRC2012_val_00000356.png"]
+    # 筛选数据集
+    orig_dataset = filter_dataset_by_filenames(orig_dataset, TARGET_IMAGES)
+    # 确保 batch_size 不大于筛选后的样本数
+    args.batchsize = min(args.batchsize, len(orig_dataset))
+    # --------------------- 新增代码结束 ---------------------
+
+    # 后续的 DataLoader 初始化不变
     loader = DataLoader(orig_dataset, batch_size=args.batchsize, shuffle=False)
 
     source_results = []
@@ -634,7 +636,6 @@ def main():
             portion=args.portion,
             admix_size=args.admix_size,
             diversity_prob=args.diversity_prob,
-            flip_prob=args.flip_prob,
             distortion_scale=args.distortion_scale,
             bsr=args.bsr,
             save_iter=(args.save_iter if args.save_iter > 0 else (5 if args.save_iter5 else None)),
@@ -742,6 +743,42 @@ def main():
     pd.DataFrame(final_rows).to_csv(args.output_csv, index=False)
     print(f"\nDetailed results saved to {args.output_csv}")
 
+# 测试batch图片
+def filter_dataset_by_filenames(dataset: AdvPNGDataset, target_filenames: List[str]) -> AdvPNGDataset:
+    """
+    筛选 AdvPNGDataset，只保留指定文件名的样本
+    适配你的 AdvPNGDataset 类（修复 img_root/img_dir 不匹配、缺少 img_paths 的问题）
+    Args:
+        dataset: 原始 AdvPNGDataset 数据集
+        target_filenames: 需要保留的图片文件名列表（如 ["img_001.png", "img_002.png"]）
+    Returns:
+        筛选后的 AdvPNGDataset
+    """
+    # 1. 构建文件名到样本索引的映射（从label_df中读取文件名）
+    filename_to_idx = {}
+    for idx in range(len(dataset.label_df)):
+        fn = dataset.label_df.iloc[idx]['filename']
+        filename_to_idx[fn] = idx
+
+    # 2. 筛选出目标文件名对应的索引
+    target_indices = []
+    for fn in target_filenames:
+        if fn in filename_to_idx:
+            target_indices.append(filename_to_idx[fn])
+        else:
+            print(f"Warning: {fn} not found in dataset, skipped")
+
+    # 3. 若没有匹配的文件，抛出友好提示（避免后续空数据集报错）
+    if not target_indices:
+        raise ValueError("No target images found in dataset! Please check your filenames.")
+
+    # 4. 构造筛选后的数据集（适配你的 AdvPNGDataset 初始化参数）
+    filtered_dataset = AdvPNGDataset(
+        img_dir=dataset.img_dir,  # 修复：用 img_dir 而非 img_root
+        label_df=dataset.label_df.iloc[target_indices].reset_index(drop=True),
+        transform=dataset.transform
+    )
+    return filtered_dataset
 
 if __name__ == '__main__':
     # 清空CUDA缓存

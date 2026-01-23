@@ -14,7 +14,7 @@ from torch.utils.data import DataLoader,  TensorDataset
 import math
 
 
-from preprocess import AdvPNGDataset, get_model_output, load_source_model, get_model_prediction
+from preprocess import AdvPNGDataset, get_model_output, get_model_prediction
 
 
 def attack(x, y, model, eps=16 / 255, iterations=10, mu=1.0):
@@ -107,7 +107,7 @@ def main():
     model_repo = ModelRepository(device)
 
     # --- 1. 攻击阶段：在内存中生成 ---
-    source_model = load_source_model(args.model, device)
+    source_model = model_repo.get_source_model(args.model, device)
 
     label_csv_path = os.path.join(args.input_dir, 'labels.csv')
     img_root = os.path.join(args.input_dir, 'images')
@@ -178,9 +178,9 @@ def main():
 
     for model_name in target_names:
         print(f"  --> Testing target model: {model_name}")
-        # 这里建议你根据之前讨论的，实现一个 load_single_model 或者 load_source_model
-        # 假设这里依然通过 repo 加载
-        current_model_info = model_repo.load_single_model(model_name)
+
+
+        current_model_info = model_repo.get_source_model(model_name)
         model = current_model_info['model']
         model.eval()
 
