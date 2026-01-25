@@ -13,7 +13,7 @@ from models import ModelRepository
 from torch.utils.data import DataLoader,  TensorDataset
 import math
 
-
+from ours原代码 import filter_dataset_by_filenames
 from preprocess import AdvPNGDataset, get_model_output, get_model_prediction
 
 
@@ -87,7 +87,7 @@ def attack(x, y, model, eps=16 / 255, iterations=10, mu=1.0):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="BSR attack")
-    parser.add_argument("--model", default='inception_v3', type=str, help="source model")
+    parser.add_argument("--model", default='tf2torch_inception_v3', type=str, help="source model")
     parser.add_argument('--output_adv_dir', default='./results/SIM/images', type=str, help='adv images dir')
     parser.add_argument('--output_csv', default='./results/SIM/results.csv', type=str, help='output CSV path')
     parser.add_argument('--input_dir', default='./data', type=str)
@@ -107,8 +107,8 @@ def main():
     model_repo = ModelRepository(device)
 
     # --- 1. 攻击阶段：在内存中生成 ---
-    source_model = model_repo.get_source_model(args.model, device)
-
+    source_model_info = model_repo.get_source_model(args.model)
+    source_model = source_model_info['model']
     label_csv_path = os.path.join(args.input_dir, 'labels.csv')
     img_root = os.path.join(args.input_dir, 'images')
     label_df = pd.read_csv(label_csv_path)
@@ -125,6 +125,17 @@ def main():
     orig_dataset = AdvPNGDataset(img_root, label_df, transform)
     loader = DataLoader(orig_dataset, batch_size=args.batchsize, shuffle=False)
 
+    # --------------------- 测试新增代码开始 ---------------------
+    # # 替换成你要运行的两张图片的文件名
+    TARGET_IMAGES = ["ILSVRC2012_val_00000470.png", "ILSVRC2012_val_00000356.png"]
+    # 筛选数据集
+    orig_dataset = filter_dataset_by_filenames(orig_dataset, TARGET_IMAGES)
+    # 确保 batch_size 不大于筛选后的样本数
+    args.batchsize = min(args.batchsize, len(orig_dataset))
+    # --------------------- 新增代码结束 ---------------------
+
+    # 后续的 DataLoader 初始化不变
+    loader = DataLoader(orig_dataset, batch_size=args.batchsize, shuffle=False)
     source_results = []
     adv_images_storage = []  # 用于暂存对抗样本 (CPU Tensor)
 
