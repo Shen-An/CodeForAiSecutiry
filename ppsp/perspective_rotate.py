@@ -117,6 +117,48 @@ def _merge_blocks(blocks):
     return torch.cat(strips, dim=2)
 
 
+def warp_perspective_then_rotate(
+    single: torch.Tensor,
+    *,
+    distortion_scale: float,
+    angle: torch.Tensor | float,
+) -> torch.Tensor:
+    """对单张图片(1,C,H,W)执行：随机透视 -> 指定角度旋转。
+
+    重要：为了保证效果一致，这里严格复用当前文件内已有的
+    _rand_perspective_params/_homography_dlt/_warp_perspective_grid_sample 以及
+    affine_grid/grid_sample 的参数设置。
+
+    参数：
+    - single: shape (1,C,H,W)
+    - distortion_scale: 透视强度
+    - angle: 旋转角（弧度），可为 float 或 0-dim Tensor
+
+    返回：变换后的 single，shape 仍为 (1,C,H,W)
+    """
+    if single.dim() != 4 or single.size(0) != 1:
+        raise ValueError(f"single must be (1,C,H,W), got {tuple(single.shape)}")
+
+    bH, bW = int(single.shape[2]), int(single.shape[3])
+    if bH <= 1 or bW <= 1:
+        return single
+
+    # 1) perspective（保持与原实现一致：每次调用都重新采样四角点）
+    src_n, dst_n = _rand_perspective_params(bH, bW, float(distortion_scale), device=single.device)
+    H_mat = _homography_dlt(src_n, dst_n)
+    single = _warp_perspective_grid_sample(single, H_mat)
+
+    # 2) rotation（保持与原实现一致：align_corners=False）
+    a = float(angle) if isinstance(angle, (int, float)) else float(angle.item())
+    angle_matrix = torch.tensor(
+        [[math.cos(a), -math.sin(a), 0.0], [math.sin(a), math.cos(a), 0.0]],
+        dtype=torch.float32,
+        device=single.device,
+    ).unsqueeze(0)
+    grid = F.affine_grid(angle_matrix, single.size(), align_corners=False)
+    single = F.grid_sample(single, grid, mode='bilinear', padding_mode='zeros', align_corners=False)
+    return single
+
 
 def _perspective_permutation_transform(
     x: torch.Tensor,
@@ -158,20 +200,12 @@ def _perspective_permutation_transform(
                 for bi in range(B):
                     single = block[bi:bi + 1]
 
-                    # perspective
-                    src_n, dst_n = _rand_perspective_params(bH, bW, distortion_scale, device=x.device)
-                    H_mat = _homography_dlt(src_n, dst_n)
-                    single = _warp_perspective_grid_sample(single, H_mat)
-
-                    # rotation
-                    angle = angles[bi]
-                    angle_matrix = torch.tensor(
-                        [[math.cos(angle), -math.sin(angle), 0], [math.sin(angle), math.cos(angle), 0]],
-                        dtype=torch.float32,
-                        device=x.device,
-                    ).unsqueeze(0)
-                    grid = F.affine_grid(angle_matrix, single.size(), align_corners=False)
-                    single = F.grid_sample(single, grid, mode='bilinear', padding_mode='zeros', align_corners=False)
+                    # perspective + rotation
+                    single = warp_perspective_then_rotate(
+                        single,
+                        distortion_scale=distortion_scale,
+                        angle=angles[bi],
+                    )
 
                     out_block[bi:bi + 1] = single
 

@@ -6,6 +6,7 @@ import numpy as np
 import math
 
 from ppsp.perspective_rotate import _rand_perspective_params, _homography_dlt, _warp_perspective_grid_sample
+from ppsp.perspective_rotate import warp_perspective_then_rotate
 
 from torchvision.utils import save_image
 
@@ -75,19 +76,73 @@ def shuffle_rotate_bsr(x, num_blocks_h=2, num_blocks_w=2, max_angle=0.2):
     return x_h_perm
 
 
-def BSR_transform(x, num_blocks_h=2, num_blocks_w=2, max_angle=0.2, num_copies=20, *,
-                  distortion_scale: float = 0.06):
-    """BSR变换：创建多个分块旋转打乱的副本"""
+def BSR_transform(
+    x,
+    num_blocks_h=2,
+    num_blocks_w=2,
+    max_angle=0.2,
+    num_copies=20,
+    *,
+    distortion_scale: float = 0.06,
+):
+    """PPSP +BSR 路径：
+
+    分块 -> 打乱 -> 旋转(BSR) -> 透视 -> 我们的旋转(第二次) ，复制 num_copies 次。
+
+    说明：
+    - 这里明确做两次旋转：一次在打乱后，一次在透视后；两次角度独立采样。
+    - 水平翻转不在这里做（由外部在进入本函数前完成）。
+    """
+
+    def _apply_block_perspective_and_post_rotate(x_in: torch.Tensor) -> torch.Tensor:
+        """对输入按『当前随机分块』逐块做随机透视，然后再逐块做一次旋转（我们的旋转）。"""
+        B, C, w, h = x_in.shape
+
+        width_length = get_block_lengths_bsr(w, num_blocks_h)
+        height_length = get_block_lengths_bsr(h, num_blocks_w)
+
+        # split blocks（保持顺序）
+        x_split_w = torch.split(x_in, width_length, dim=2)
+        blocks_2d = []
+        for w_block in x_split_w:
+            blocks_2d.append(list(torch.split(w_block, height_length, dim=3)))
+
+        for i in range(num_blocks_h):
+            for j in range(num_blocks_w):
+                block = blocks_2d[i][j]
+                bH, bW = block.shape[2], block.shape[3]
+                if bH <= 1 or bW <= 1:
+                    continue
+
+                out_block = block.clone()
+
+                # 第二次旋转角（我们的旋转）：对该块的每张图独立采样，且与 BSR 中第一次旋转无关
+                post_angles = torch.clamp(torch.randn(B, device=x_in.device) * 0.05, -max_angle, max_angle)
+
+                for bi in range(B):
+                    single = block[bi : bi + 1]
+
+                    # 透视 + 我们的旋转（抽象为公共方法，保证参数一致）
+                    single = warp_perspective_then_rotate(
+                        single,
+                        distortion_scale=distortion_scale,
+                        angle=post_angles[bi],
+                    )
+
+                    out_block[bi : bi + 1] = single
+
+                blocks_2d[i][j] = out_block
+
+        merged_strips = [torch.cat(blocks_2d[i], dim=3) for i in range(num_blocks_h)]
+        return torch.cat(merged_strips, dim=2)
+
     transformed_copies = []
     for _ in range(num_copies):
-        transformed_copy = shuffle_rotate_bsr(
-            x,
-            num_blocks_h,
-            num_blocks_w,
-            max_angle,
-            distortion_scale=distortion_scale,
-        )
-        transformed_copies.append(transformed_copy)
+        # 1) 分块+打乱+旋转（第一次旋转）
+        x_sr = shuffle_rotate_bsr(x, num_blocks_h, num_blocks_w, max_angle)
+        # 2) 透视 + 我们的旋转（第二次旋转）
+        x_srp_r2 = _apply_block_perspective_and_post_rotate(x_sr)
+        transformed_copies.append(x_srp_r2)
 
     return torch.cat(transformed_copies, dim=0)
 
@@ -143,7 +198,7 @@ def shuffle_rotate_bsr_PR(x, num_blocks_h=2, num_blocks_w=2, max_angle=0.2, *,
     width_length = get_block_lengths_bsr(w, num_blocks_h)
     height_length = get_block_lengths_bsr(h, num_blocks_w)
 
-    # === 置换：替换为 notebook 版本（宽/高分别随机置换） ===
+    # === 置换：替换为 notebook 版本（宽/高分别随机置换）===
     width_perm = np.random.permutation(np.arange(num_blocks_h))
     height_perm = np.random.permutation(np.arange(num_blocks_w))
 

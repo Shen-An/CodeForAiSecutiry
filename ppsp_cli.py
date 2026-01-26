@@ -21,6 +21,7 @@ from ppsp.admix import admix
 from ppsp.perspective_rotate import _rand_perspective_params, _homography_dlt, _warp_perspective_grid_sample, \
     _perspective_permutation_transform
 from preprocess import AdvPNGDataset, get_model_output, get_model_prediction
+from ppsp.TIM import build_tim_kernel, tim_grad
 
 
 def parse_args():
@@ -77,6 +78,27 @@ def parse_args():
     # 水平翻转
     parser.add_argument('--flip_prob', default=0.6, type=float, help='probability to apply random horizontal flip before block transforms')
 
+    # --- SI (Scale-Invariance) ---
+    # 说明：
+    # - 开启后使用 SI-MI-FGSM 的多尺度梯度估计（在 PPSP 的变换采样之后做 loss/grad）。
+    # - 默认关闭，保持原 MI-FGSM 行为一致。
+    parser.add_argument('--use_si', dest='use_si', action='store_true', help='enable SI (scale-invariance) gradient')
+    parser.add_argument('--no_si', dest='use_si', action='store_false', help='disable SI gradient')
+    parser.set_defaults(use_si=False)
+    parser.add_argument(
+        '--si_scales',
+        default='1,0.5,0.25,0.125,0.0625',
+        type=str,
+        help='comma-separated SI scales, e.g. "1,0.5,0.25"',
+    )
+
+    # --- TIM (Translation-Invariant) ---
+    parser.add_argument('--use_tim', dest='use_tim', action='store_true', help='enable TIM (gaussian smoothing on gradient)')
+    parser.add_argument('--no_tim', dest='use_tim', action='store_false', help='disable TIM')
+    parser.set_defaults(use_tim=False)
+    parser.add_argument('--tim_kernel', default=7, type=int, help='TIM gaussian kernel size (odd), e.g. 7')
+    parser.add_argument('--tim_sigma', default=1.5, type=float, help='TIM gaussian sigma, e.g. 1.5')
+
     return parser.parse_args()
 
 
@@ -108,35 +130,58 @@ def mifgsm_attack_ppsp(x, y, model, eps=16 / 255, iterations=10, mu=1.0,
                       distortion_scale=0.06, bsr: bool = False,
                       save_iter: int | None = None,
                       save_trans_dir: str | None = None,
-                      filenames: Optional[list[str]] = None):
+                      filenames: Optional[list[str]] = None,
+                      use_si: bool = False,
+                      si_scales: tuple[float, ...] = (1.0, 0.5, 0.25, 0.125, 0.0625),
+                      use_tim: bool = False,
+                      tim_kernel: int = 7,
+                      tim_sigma: float = 1.5):
     """MI-FGSM + (BSR 或 默认分块透视+旋转)。
 
     - bsr=True:  BSR 路径（置换 + 分块透视 + 分块旋转），旋转角度由 max_angle_bsr 控制
     - bsr=False: 默认分块透视 + 分块旋转，旋转角度由 max_angle_default 控制
 
     save_iter: 若给定(1-based)，则在该次迭代保存 x_aug 的所有 num_copies 变换副本。
+
+    use_si:
+      True  => 使用 SI-MI-FGSM 的多尺度梯度估计（对 x_adv 求梯度，内部做 x_adv*scale）
+      False => 使用原先单尺度 loss.backward() 的梯度
     """
     alpha = eps / iterations
     x_adv = x.clone().requires_grad_(True)
     momentum = torch.zeros_like(x).to(x.device)
 
+    # 仅构建一次 TIM kernel，避免每次迭代重复开销
+    tim_k = None
+    if use_tim:
+        tim_k = build_tim_kernel(kernlen=int(tim_kernel), nsig=float(tim_sigma), channels=int(x.size(1))).to(x.device)
+
     for i in range(iterations):
-        # 应用输入变换
-        if use_diversity:
-            x_transformed = input_diversity(x_adv, prob=diversity_prob)
-        else:
-            x_transformed = x_adv
+        x_transformed = x_adv
 
         # 水平翻转：在进入 BSR/默认分块变换前按概率执行
         if flip_prob > 0.0 and torch.rand(1, device=x_transformed.device).item() < flip_prob:
             # x: (B,C,W,H) 这里 H 维在 dim=3，对其做翻转实现水平翻转
             x_transformed = torch.flip(x_transformed, dims=[3])
 
+        # admix 放在 SI 之前：先对原 batch 做混合，再做多尺度复制
+        admix_mult = 1
         if use_admix:
             x_transformed = admix(x_transformed, portion=portion, size=admix_size)
-            y_expanded = y.repeat(admix_size * num_copies)
-        else:
-            y_expanded = y.repeat(num_copies)
+            admix_mult = int(admix_size)
+
+        # --- SI (Scale-Invariance) 放在 BSR 创建副本前 ---
+        si_mult = 1
+        if use_si:
+            si_mult = len(si_scales)
+            # 直接按 scale 乘像素值并在 batch 维拼接，得到 (B*si_mult*admix_mult, C, H, W)
+            x_transformed = torch.cat([x_transformed * float(s) for s in si_scales], dim=0)
+            if filenames is not None:
+                filenames = list(filenames) * si_mult
+
+        # 此时 x_transformed 的 batch = B * admix_mult * si_mult
+        # 后续 BSR/透视置换会再复制 num_copies 次，所以标签也要匹配 (admix_mult*si_mult*num_copies)
+        y_expanded = y.repeat(admix_mult * si_mult * num_copies)
 
         iter_1based = i + 1
         if (
@@ -172,6 +217,12 @@ def mifgsm_attack_ppsp(x, y, model, eps=16 / 255, iterations=10, mu=1.0,
                 max_angle=max_angle_default,
             )
 
+        # DI 应用在 copies 内部：对每张副本独立采样（保持随机性），而不是只对整批一次。
+        if use_diversity:
+            # input_diversity 内部每次调用都会采样一次随机 resize/pad，所以直接对整个 x_aug 调用即可
+            # （batch 内每张图共享同一次 rnd/pad 采样是 DI 的常见实现；如果你要 per-image 独立采样，需要改 DIM 实现）
+            x_aug = input_diversity(x_aug, prob=diversity_prob)
+
         # dump intermediate transformed copies at iteration save_iter
         if (
             save_iter is not None
@@ -202,9 +253,15 @@ def mifgsm_attack_ppsp(x, y, model, eps=16 / 255, iterations=10, mu=1.0,
         model.zero_grad()
         if x_adv.grad is not None:
             x_adv.grad.zero_()
-        loss.backward()
 
+        # SI 已经用于“生成多尺度副本给 BSR”，这里保持单次 backward
+        loss.backward()
         grad = x_adv.grad.data
+
+        # TIM：对梯度做高斯平滑（Translation-Invariant）
+        if use_tim and tim_k is not None:
+            grad = tim_grad(grad, kernel=tim_k)
+
         l1 = torch.mean(torch.abs(grad), dim=(1, 2, 3), keepdim=True) + 1e-8
         grad = grad / l1
 
@@ -256,6 +313,12 @@ def main():
 
     print(f"\n[Step 1/3] Attacking in Memory...")
 
+    # 解析 si_scales（逗号分隔）
+    try:
+        si_scales = tuple(float(s.strip()) for s in str(args.si_scales).split(','))
+    except Exception as e:
+        raise ValueError(f"Invalid --si_scales: {args.si_scales}") from e
+
     for batch_idx, (x_batch, y_batch, filename_batch) in enumerate(tqdm(loader, desc="Attacking")):
         x_batch = x_batch.to(device)
         y_batch = (y_batch+1).to(device)
@@ -285,6 +348,11 @@ def main():
             save_iter=(args.save_iter if args.save_iter > 0 else (5 if args.save_iter5 else None)),
             save_trans_dir=(args.save_trans_dir if (args.save_iter > 0 or args.save_iter5) else None),
             filenames=list(filename_batch),
+            use_si=args.use_si,
+            si_scales=si_scales,
+            use_tim=args.use_tim,
+            tim_kernel=args.tim_kernel,
+            tim_sigma=args.tim_sigma,
         )
 
         source_adv_preds = get_model_prediction(source_model, x_adv_batch)
