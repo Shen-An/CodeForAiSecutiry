@@ -135,7 +135,7 @@ def mifgsm_attack_ppsp(x, y, model, eps=16 / 255, iterations=10, mu=1.0,
                       si_scales: tuple[float, ...] = (1.0, 0.5, 0.25, 0.125, 0.0625),
                       use_tim: bool = False,
                       tim_kernel: int = 7,
-                      tim_sigma: float = 1.5):
+                      tim_sigma: float = 3):
     """MI-FGSM + (BSR 或 默认分块透视+旋转)。
 
     - bsr=True:  BSR 路径（置换 + 分块透视 + 分块旋转），旋转角度由 max_angle_bsr 控制
@@ -157,7 +157,13 @@ def mifgsm_attack_ppsp(x, y, model, eps=16 / 255, iterations=10, mu=1.0,
         tim_k = build_tim_kernel(kernlen=int(tim_kernel), nsig=float(tim_sigma), channels=int(x.size(1))).to(x.device)
 
     for i in range(iterations):
-        x_transformed = x_adv
+               
+        if use_diversity:
+            # input_diversity 内部每次调用都会采样一次随机 resize/pad，所以直接对整个 x_aug 调用即可
+            # （batch 内每张图共享同一次 rnd/pad 采样是 DI 的常见实现；如果你要 per-image 独立采样，需要改 DIM 实现）
+            x_transformed = input_diversity(x_adv, prob=diversity_prob)
+        else:
+            x_transformed = x_adv
 
         # 水平翻转：在进入 BSR/默认分块变换前按概率执行
         if flip_prob > 0.0 and torch.rand(1, device=x_transformed.device).item() < flip_prob:
@@ -217,12 +223,7 @@ def mifgsm_attack_ppsp(x, y, model, eps=16 / 255, iterations=10, mu=1.0,
                 max_angle=max_angle_default,
             )
 
-        # DI 应用在 copies 内部：对每张副本独立采样（保持随机性），而不是只对整批一次。
-        if use_diversity:
-            # input_diversity 内部每次调用都会采样一次随机 resize/pad，所以直接对整个 x_aug 调用即可
-            # （batch 内每张图共享同一次 rnd/pad 采样是 DI 的常见实现；如果你要 per-image 独立采样，需要改 DIM 实现）
-            x_aug = input_diversity(x_aug, prob=diversity_prob)
-
+ 
         # dump intermediate transformed copies at iteration save_iter
         if (
             save_iter is not None
@@ -363,7 +364,7 @@ def main():
             true_label = int(y_batch[i].item())
             s_adv_idx = int(source_adv_preds[i])
             s_orig_idx = int(source_orig_preds[i])
-            print(true_label, s_adv_idx)
+            # print(true_label, s_adv_idx)
             source_results.append({
                 "filename": filename_batch[i],
                 "true_label": true_label,

@@ -122,19 +122,13 @@ def warp_perspective_then_rotate(
     *,
     distortion_scale: float,
     angle: torch.Tensor | float,
+    flip_prob: float = 0.0,
 ) -> torch.Tensor:
-    """对单张图片(1,C,H,W)执行：随机透视 -> 指定角度旋转。
+    """对单张图片(1,C,H,W)执行：随机透视 -> 指定角度旋转 -> （可选）块内水平翻转。
 
-    重要：为了保证效果一致，这里严格复用当前文件内已有的
-    _rand_perspective_params/_homography_dlt/_warp_perspective_grid_sample 以及
-    affine_grid/grid_sample 的参数设置。
-
-    参数：
-    - single: shape (1,C,H,W)
-    - distortion_scale: 透视强度
-    - angle: 旋转角（弧度），可为 float 或 0-dim Tensor
-
-    返回：变换后的 single，shape 仍为 (1,C,H,W)
+    flip_prob:
+      - 每个块（每张图的该块）独立采样一次；
+      - 翻转发生在该块完成透视+旋转之后（块内最后一步）。
     """
     if single.dim() != 4 or single.size(0) != 1:
         raise ValueError(f"single must be (1,C,H,W), got {tuple(single.shape)}")
@@ -157,6 +151,12 @@ def warp_perspective_then_rotate(
     ).unsqueeze(0)
     grid = F.affine_grid(angle_matrix, single.size(), align_corners=False)
     single = F.grid_sample(single, grid, mode='bilinear', padding_mode='zeros', align_corners=False)
+
+    # 3) per-block horizontal flip (after perspective+rotation)
+    if flip_prob and float(flip_prob) > 0.0:
+        if torch.rand(1, device=single.device).item() < float(flip_prob):
+            single = torch.flip(single, dims=[3])
+
     return single
 
 
@@ -168,6 +168,7 @@ def _perspective_permutation_transform(
     num_copies: int,
     distortion_scale: float,
     max_angle: float,
+    flip_prob: float = 0.0,
 ) -> torch.Tensor:
     """不使用 BSR 时：只做『分块透视 + 分块旋转』（不做相邻置换），复制 num_copies 次。
 
@@ -205,6 +206,7 @@ def _perspective_permutation_transform(
                         single,
                         distortion_scale=distortion_scale,
                         angle=angles[bi],
+                        flip_prob=flip_prob,
                     )
 
                     out_block[bi:bi + 1] = single

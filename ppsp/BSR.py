@@ -84,14 +84,11 @@ def BSR_transform(
     num_copies=20,
     *,
     distortion_scale: float = 0.06,
+    flip_prob: float = 0.0,
 ):
     """PPSP +BSR 路径：
 
-    分块 -> 打乱 -> 旋转(BSR) -> 透视 -> 我们的旋转(第二次) ，复制 num_copies 次。
-
-    说明：
-    - 这里明确做两次旋转：一次在打乱后，一次在透视后；两次角度独立采样。
-    - 水平翻转不在这里做（由外部在进入本函数前完成）。
+    分块 -> 打乱 -> 旋转(BSR) -> 透视 -> 我们的旋转(第二次) （-> 可选：块内最后水平翻转），复制 num_copies 次。
     """
 
     def _apply_block_perspective_and_post_rotate(x_in: torch.Tensor) -> torch.Tensor:
@@ -122,11 +119,12 @@ def BSR_transform(
                 for bi in range(B):
                     single = block[bi : bi + 1]
 
-                    # 透视 + 我们的旋转（抽象为公共方法，保证参数一致）
+                    # 透视 + 我们的旋转 +（可选）块内最后翻转
                     single = warp_perspective_then_rotate(
                         single,
                         distortion_scale=distortion_scale,
                         angle=post_angles[bi],
+                        flip_prob=flip_prob,
                     )
 
                     out_block[bi : bi + 1] = single
