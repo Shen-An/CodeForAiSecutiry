@@ -135,7 +135,7 @@ def mifgsm_attack_ppsp(x, y, model, eps=16 / 255, iterations=10, mu=1.0,
                       si_scales: tuple[float, ...] = (1.0, 0.5, 0.25, 0.125, 0.0625),
                       use_tim: bool = False,
                       tim_kernel: int = 7,
-                      tim_sigma: float = 1.5):
+                      tim_sigma: float = 3):
     """MI-FGSM + (BSR 或 默认分块透视+旋转)。
 
     - bsr=True:  BSR 路径（置换 + 分块透视 + 分块旋转），旋转角度由 max_angle_bsr 控制
