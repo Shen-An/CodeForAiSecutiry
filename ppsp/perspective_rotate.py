@@ -155,10 +155,7 @@ def warp_perspective_then_rotate(
     grid = F.affine_grid(angle_matrix, single.size(), align_corners=False)
     single = F.grid_sample(single, grid, mode='bilinear', padding_mode='zeros', align_corners=False)
 
-    # 3) per-block horizontal flip (after perspective+rotation)
-    if flip_prob and float(flip_prob) > 0.0:
-        if torch.rand(1, device=single.device).item() < float(flip_prob):
-            single = torch.flip(single, dims=[3])
+   
 
     # 4) per-block aspect-ratio stretching (after flip)
     if stretch_factor and float(stretch_factor) != 0.0:
@@ -174,6 +171,10 @@ def warp_perspective_then_rotate(
         # 先缩放到 (new_h, new_w)，再插值回 (bH, bW)
         resized = F.interpolate(single, size=(new_h, new_w), mode='bilinear', align_corners=False)
         single = F.interpolate(resized, size=(bH, bW), mode='bilinear', align_corners=False)
+     # 3) per-block horizontal flip (after perspective+rotation)
+    if flip_prob and float(flip_prob) > 0.0:
+        if torch.rand(1, device=single.device).item() < float(flip_prob):
+            single = torch.flip(single, dims=[3])
 
     return single
 
