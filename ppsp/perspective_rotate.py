@@ -123,12 +123,15 @@ def warp_perspective_then_rotate(
     distortion_scale: float,
     angle: torch.Tensor | float,
     flip_prob: float = 0.0,
+    shear_h: float = 0.0,
+    shear_v: float = 0.0,
 ) -> torch.Tensor:
-    """对单张图片(1,C,H,W)执行：随机透视 -> 指定角度旋转 -> （可选）块内水平翻转。
+    """对单张图片(1,C,H,W)执行：随机透视 -> 指定角度旋转 ->（可选）块内水平翻转 ->（可选）块内错切。
 
-    flip_prob:
-      - 每个块（每张图的该块）独立采样一次；
-      - 翻转发生在该块完成透视+旋转之后（块内最后一步）。
+    约定：
+    - flip 发生在块内透视/旋转之后；
+    - shear 发生在 flip 之后（块内最后一步）；
+    - shear 参数使用随机采样：Sh ~ U(-shear_h, shear_h), Sv ~ U(-shear_v, shear_v)
     """
     if single.dim() != 4 or single.size(0) != 1:
         raise ValueError(f"single must be (1,C,H,W), got {tuple(single.shape)}")
@@ -157,6 +160,23 @@ def warp_perspective_then_rotate(
         if torch.rand(1, device=single.device).item() < float(flip_prob):
             single = torch.flip(single, dims=[3])
 
+    # 4) per-block shearing (after flip)
+    if (shear_h or shear_v) and (float(shear_h) != 0.0 or float(shear_v) != 0.0):
+        sh = 0.0
+        sv = 0.0
+        if float(shear_h) != 0.0:
+            sh = float(torch.empty((), device=single.device).uniform_(-float(shear_h), float(shear_h)).item())
+        if float(shear_v) != 0.0:
+            sv = float(torch.empty((), device=single.device).uniform_(-float(shear_v), float(shear_v)).item())
+
+        shear_matrix = torch.tensor(
+            [[1.0, sh, 0.0], [sv, 1.0, 0.0]],
+            dtype=torch.float32,
+            device=single.device,
+        ).unsqueeze(0)
+        grid = F.affine_grid(shear_matrix, single.size(), align_corners=False)
+        single = F.grid_sample(single, grid, mode='bilinear', padding_mode='zeros', align_corners=False)
+
     return single
 
 
@@ -169,6 +189,8 @@ def _perspective_permutation_transform(
     distortion_scale: float,
     max_angle: float,
     flip_prob: float = 0.0,
+    shear_h: float = 0.0,
+    shear_v: float = 0.0,
 ) -> torch.Tensor:
     """不使用 BSR 时：只做『分块透视 + 分块旋转』（不做相邻置换），复制 num_copies 次。
 
@@ -207,6 +229,8 @@ def _perspective_permutation_transform(
                         distortion_scale=distortion_scale,
                         angle=angles[bi],
                         flip_prob=flip_prob,
+                        shear_h=shear_h,
+                        shear_v=shear_v,
                     )
 
                     out_block[bi:bi + 1] = single

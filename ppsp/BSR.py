@@ -85,10 +85,12 @@ def BSR_transform(
     *,
     distortion_scale: float = 0.06,
     flip_prob: float = 0.0,
+    shear_h: float = 0.0,
+    shear_v: float = 0.0,
 ):
     """PPSP +BSR 路径：
 
-    分块 -> 打乱 -> 旋转(BSR) -> 透视 -> 我们的旋转(第二次) （-> 可选：块内最后水平翻转），复制 num_copies 次。
+    分块 -> 打乱 -> 旋转(BSR) -> 透视 -> 我们的旋转(第二次) （-> 可选：块内最后水平翻转 -> 可选：块内最后错切），复制 num_copies 次。
     """
 
     def _apply_block_perspective_and_post_rotate(x_in: torch.Tensor) -> torch.Tensor:
@@ -119,12 +121,14 @@ def BSR_transform(
                 for bi in range(B):
                     single = block[bi : bi + 1]
 
-                    # 透视 + 我们的旋转 +（可选）块内最后翻转
+                    # 透视 + 我们的旋转 +（可选）块内最后翻转 +（可选）块内最后错切
                     single = warp_perspective_then_rotate(
                         single,
                         distortion_scale=distortion_scale,
                         angle=post_angles[bi],
                         flip_prob=flip_prob,
+                        shear_h=shear_h,
+                        shear_v=shear_v,
                     )
 
                     out_block[bi : bi + 1] = single
