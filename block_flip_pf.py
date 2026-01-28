@@ -99,10 +99,9 @@ def parse_args():
     parser.add_argument('--tim_kernel', default=7, type=int, help='TIM gaussian kernel size (odd), e.g. 7')
     parser.add_argument('--tim_sigma', default=1.5, type=float, help='TIM gaussian sigma, e.g. 1.5')
 
-    # 块内错切（Shearing）：不需要概率；每个块都会执行一次随机错切（当 shear_h/shear_v 非 0）
-    # Sh ~ U(-shear_h, shear_h), Sv ~ U(-shear_v, shear_v)
-    parser.add_argument('--shear_h', default=0.1, type=float, help='max horizontal shear factor Sh (sampled uniformly in [-shear_h, shear_h])')
-    parser.add_argument('--shear_v', default=0.1, type=float, help='max vertical shear factor Sv (sampled uniformly in [-shear_v, shear_v])')
+    # 块内拉伸（Aspect-Ratio Stretching）：单参数
+    # 采样：lambda_w, lambda_h ~ U(-stretch_factor, stretch_factor)
+    parser.add_argument('--stretch_factor', default=0.1, type=float, help='max aspect-ratio stretch factor (lambda_w/lambda_h sampled uniformly in [-stretch_factor, stretch_factor])')
 
     return parser.parse_args()
 
@@ -132,8 +131,7 @@ def mifgsm_attack_ppsp(x, y, model, eps=16 / 255, iterations=10, mu=1.0,
                       num_copies=20, use_diversity=True, use_admix=False,
                       portion=0.2, admix_size=3, diversity_prob=0.5,
                       flip_prob: float = 0.4,
-                      shear_h: float = 0.0,
-                      shear_v: float = 0.0,
+                      stretch_factor: float = 0.0,
                       distortion_scale=0.06, bsr: bool = False,
                       save_iter: int | None = None,
                       save_trans_dir: str | None = None,
@@ -215,8 +213,7 @@ def mifgsm_attack_ppsp(x, y, model, eps=16 / 255, iterations=10, mu=1.0,
                 num_copies,
                 distortion_scale=distortion_scale,
                 flip_prob=flip_prob,
-                shear_h=shear_h,
-                shear_v=shear_v,
+                stretch_factor=stretch_factor,
             )
         else:
             x_aug = _perspective_permutation_transform(
@@ -227,8 +224,7 @@ def mifgsm_attack_ppsp(x, y, model, eps=16 / 255, iterations=10, mu=1.0,
                 distortion_scale=distortion_scale,
                 max_angle=max_angle_default,
                 flip_prob=flip_prob,
-                shear_h=shear_h,
-                shear_v=shear_v,
+                stretch_factor=stretch_factor,
             )
 
         # dump intermediate transformed copies at iteration save_iter
@@ -351,8 +347,7 @@ def main():
             admix_size=args.admix_size,
             diversity_prob=args.diversity_prob,
             flip_prob=args.flip_prob,
-            shear_h=args.shear_h,
-            shear_v=args.shear_v,
+            stretch_factor=args.stretch_factor,
             distortion_scale=args.distortion_scale,
             bsr=args.bsr,
             save_iter=(args.save_iter if args.save_iter > 0 else (5 if args.save_iter5 else None)),
