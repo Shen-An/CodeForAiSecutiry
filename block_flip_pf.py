@@ -97,7 +97,7 @@ def parse_args():
     parser.add_argument('--no_tim', dest='use_tim', action='store_false', help='disable TIM')
     parser.set_defaults(use_tim=False)
     parser.add_argument('--tim_kernel', default=7, type=int, help='TIM gaussian kernel size (odd), e.g. 7')
-    parser.add_argument('--tim_sigma', default=1.5, type=float, help='TIM gaussian sigma, e.g. 1.5')
+    parser.add_argument('--tim_sigma', default=3, type=float, help='TIM gaussian sigma, e.g. 3')
 
     # 块内拉伸（Aspect-Ratio Stretching）：单参数
     # 采样：lambda_w, lambda_h ~ U(-stretch_factor, stretch_factor)
