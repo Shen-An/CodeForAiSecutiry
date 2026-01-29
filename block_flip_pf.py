@@ -59,7 +59,7 @@ def parse_args():
 
     # 旋转角度拆分：BSR 与默认透视分块使用不同 max_angle，便于组件化开关
     parser.add_argument("--max_angle_bsr", default=0.2, type=float, help="maximum rotation angle for BSR")
-    parser.add_argument("--max_angle_default", default=1.2, type=float, help="maximum rotation angle for default (non-BSR)")
+    parser.add_argument("--max_angle_default", default=0, type=float, help="maximum rotation angle for default (non-BSR)")
 
     # Perspective params
     parser.add_argument("--distortion_scale", default=0.26, type=float, help="perspective distortion scale (BCTOT D)")
@@ -76,7 +76,7 @@ def parse_args():
     parser.set_defaults(one_batch=False)
 
     # 水平翻转
-    parser.add_argument('--flip_prob', default=0.4, type=float, help='probability to apply per-block random horizontal flip after per-block perspective+rotation')
+    parser.add_argument('--flip_prob', default=0.5, type=float, help='probability to apply per-block random horizontal flip after per-block perspective+rotation')
 
     # --- SI (Scale-Invariance) ---
     # 说明：

@@ -145,15 +145,15 @@ def warp_perspective_then_rotate(
     H_mat = _homography_dlt(src_n, dst_n)
     single = _warp_perspective_grid_sample(single, H_mat)
 
-    # 2) rotation（保持与原实现一致：align_corners=False）
-    a = float(angle) if isinstance(angle, (int, float)) else float(angle.item())
-    angle_matrix = torch.tensor(
-        [[math.cos(a), -math.sin(a), 0.0], [math.sin(a), math.cos(a), 0.0]],
-        dtype=torch.float32,
-        device=single.device,
-    ).unsqueeze(0)
-    grid = F.affine_grid(angle_matrix, single.size(), align_corners=False)
-    single = F.grid_sample(single, grid, mode='bilinear', padding_mode='zeros', align_corners=False)
+    # # 2) rotation（保持与原实现一致：align_corners=False）
+    # a = float(angle) if isinstance(angle, (int, float)) else float(angle.item())
+    # angle_matrix = torch.tensor(
+    #     [[math.cos(a), -math.sin(a), 0.0], [math.sin(a), math.cos(a), 0.0]],
+    #     dtype=torch.float32,
+    #     device=single.device,
+    # ).unsqueeze(0)
+    # grid = F.affine_grid(angle_matrix, single.size(), align_corners=False)
+    # single = F.grid_sample(single, grid, mode='bilinear', padding_mode='zeros', align_corners=False)
 
     # 3) per-block horizontal flip (after perspective+rotation)
     if flip_prob and float(flip_prob) > 0.0:

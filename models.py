@@ -11,7 +11,7 @@ from torch_nets import (
     tf2torch_resnet_v2_101,
     tf2torch_resnet_v2_152,
     tf2torch_inc_res_v2,
-    tf2torch_adv_inception_v3,
+    # tf2torch_adv_inception_v3,
     tf2torch_ens3_adv_inc_v3,
     tf2torch_ens4_adv_inc_v3,
     tf2torch_ens_adv_inc_res_v2,
@@ -52,8 +52,8 @@ class ModelRepository:
             net = tf2torch_resnet_v2_152
         elif net_name == 'tf2torch_inc_res_v2':
             net = tf2torch_inc_res_v2
-        elif net_name == 'tf2torch_adv_inception_v3':
-            net = tf2torch_adv_inception_v3
+        # elif net_name == 'tf2torch_adv_inception_v3':
+        #     net = tf2torch_adv_inception_v3
         elif net_name == 'tf2torch_ens3_adv_inc_v3':
             net = tf2torch_ens3_adv_inc_v3
         elif net_name == 'tf2torch_ens4_adv_inc_v3':
@@ -81,7 +81,7 @@ class ModelRepository:
             'tf2torch_resnet_v2_101',
             'tf2torch_resnet_v2_152',
             'tf2torch_inc_res_v2',
-            'tf2torch_adv_inception_v3',
+            # 'tf2torch_adv_inception_v3',
             'tf2torch_ens3_adv_inc_v3',
             'tf2torch_ens4_adv_inc_v3',
             'tf2torch_ens_adv_inc_res_v2'
