@@ -161,19 +161,19 @@ def warp_perspective_then_rotate(
             single = torch.flip(single, dims=[3])
 
     # 4) per-block aspect-ratio stretching (after flip)
-    if stretch_factor and float(stretch_factor) != 0.0:
-        sf = float(stretch_factor)
-        # lambda_w, lambda_h ~ U(-sf, sf)
-        lw = float(torch.empty((), device=single.device).uniform_(-sf, sf).item())
-        lh = float(torch.empty((), device=single.device).uniform_(-sf, sf).item())
+    # if stretch_factor and float(stretch_factor) != 0.0:
+    #     sf = float(stretch_factor)
+    #     # lambda_w, lambda_h ~ U(-sf, sf)
+    #     lw = float(torch.empty((), device=single.device).uniform_(-sf, sf).item())
+    #     lh = float(torch.empty((), device=single.device).uniform_(-sf, sf).item())
 
-        # 目标尺寸（至少为 1，避免插值报错）
-        new_h = max(1, int(round(bH * (1.0 + lh))))
-        new_w = max(1, int(round(bW * (1.0 + lw))))
+    #     # 目标尺寸（至少为 1，避免插值报错）
+    #     new_h = max(1, int(round(bH * (1.0 + lh))))
+    #     new_w = max(1, int(round(bW * (1.0 + lw))))
 
-        # 先缩放到 (new_h, new_w)，再插值回 (bH, bW)
-        resized = F.interpolate(single, size=(new_h, new_w), mode='bilinear', align_corners=False)
-        single = F.interpolate(resized, size=(bH, bW), mode='bilinear', align_corners=False)
+    #     # 先缩放到 (new_h, new_w)，再插值回 (bH, bW)
+    #     resized = F.interpolate(single, size=(new_h, new_w), mode='bilinear', align_corners=False)
+    #     single = F.interpolate(resized, size=(bH, bW), mode='bilinear', align_corners=False)
     
 
     return single
