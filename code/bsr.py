@@ -10,8 +10,10 @@ from tqdm.notebook import tqdm
 import math
 import scipy.stats as st  # 添加缺失的导入
 
-# 从PMRT导入模型和工具函数
-from PMRT import *
+
+
+from models import ModelRepository, load_image_and_transform
+from preprocess import get_model_prediction
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")

@@ -21,6 +21,8 @@ from preprocess import AdvPNGDataset
 from ppsp.perspective_rotate import _perspective_permutation_transform
 # 新增：TIM
 from ppsp.TIM import build_tim_kernel, tim_grad
+# 新增：SIM（Scale-Invariant Method）
+from ppsp.sim import si_gradient
 
 
 class EnsembleModel(nn.Module):
@@ -152,13 +154,20 @@ def attack(
     use_tim: bool = False,
     tim_kernel: int = 15,
     tim_sigma: float = 3.0,
+    # --- SIM ---
+    use_sim: bool = False,
+    sim_scales: tuple[float, ...] = (1.0, 1 / 2, 1 / 4, 1 / 8, 1 / 16),
 ):
-    """MI-FGSM + DI +（可选）PPSP: 分块透视/翻转 + TIM: 高斯平滑梯度。
+    """MI-FGSM + DI +（可选）PPSP(PF) +（可选）TIM +（可选）SIM。
 
-    - use_pf=False: 保持原脚本 DI-MI-FGSM 行为
-    - use_pf=True : 在每次迭代里，对 x_div 采样 num_copies 个 PF 变换副本，
-                    对副本取平均 loss 来估计梯度（提升可迁移性）
-    - use_tim=True: 对每次迭代的梯度应用 TIM 高斯平滑
+    组合规则（并行开关，互不排斥）：
+      - use_sim=True  : 使用 SI 多尺度累计梯度（对 x_adv 求梯度）
+      - use_sim=False : 使用单尺度梯度
+      - use_pf/use_tim/use_sim 可以任意组合开启
+
+    备注：
+      - SIM 通过 ppsp.sim.si_gradient 实现（传统 SI：对 x_adv*scale 前向，但对 x_adv 求梯度并累加）。
+      - PF/DI/TIM 都作用在“每个 scale 的 loss/grad 估计”内部。
     """
     device = x.device
     x_adv = x.clone().detach().requires_grad_(True)
@@ -174,30 +183,48 @@ def attack(
     for _ in range(iterations):
         x_adv.requires_grad = True
 
-        # 1) DI
-        x_div = input_diversity(x_adv, prob) if prob > 0 else x_adv
+        # 统一的“给定输入张量 -> logits”封装：内部组合 DI/PF
+        def _forward_logits(x_in: torch.Tensor) -> torch.Tensor:
+            # 1) DI
+            x_div = input_diversity(x_in, prob) if prob > 0 else x_in
 
-        # 2) PPSP PF copies（可选）
-        if use_pf:
-            x_aug = _apply_pf_copies(
-                x_div,
-                num_blocks_h=num_blocks_h,
-                num_blocks_w=num_blocks_w,
-                num_copies=num_copies,
-                distortion_scale=distortion_scale,
-                max_angle=max_angle_default,
-                flip_prob=flip_prob,
-                stretch_factor=stretch_factor,
-            )
-            y_expanded = y.repeat_interleave(num_copies)
+            # 2) PF copies（可选）
+            if use_pf:
+                x_aug = _apply_pf_copies(
+                    x_div,
+                    num_blocks_h=num_blocks_h,
+                    num_blocks_w=num_blocks_w,
+                    num_copies=num_copies,
+                    distortion_scale=distortion_scale,
+                    max_angle=max_angle_default,
+                    flip_prob=flip_prob,
+                    stretch_factor=stretch_factor,
+                )
+                return get_model_output(model, x_aug)
 
-            output = get_model_output(model, x_aug)
-            loss = F.cross_entropy(output, y_expanded, reduction='mean')
+            return get_model_output(model, x_div)
+
+        if use_sim:
+            # SIM 接口要求：model(x)->logits。这里用一个轻量 wrapper 复用现有组合逻辑。
+            class _Wrapped(nn.Module):
+                def forward(self, xin: torch.Tensor) -> torch.Tensor:
+                    return _forward_logits(xin)
+
+            if use_pf:
+                # PF 会把 batch 扩到 B*num_copies，因此 label 需要同步扩展
+                y_si = y.repeat_interleave(num_copies)
+            else:
+                y_si = y
+
+            grad = si_gradient(_Wrapped(), x_adv, y_si, scales=sim_scales)
         else:
-            output = get_model_output(model, x_div)
-            loss = F.cross_entropy(output, y)
-
-        grad = torch.autograd.grad(loss, [x_adv])[0]
+            logits = _forward_logits(x_adv)
+            if use_pf:
+                y_used = y.repeat_interleave(num_copies)
+            else:
+                y_used = y
+            loss = F.cross_entropy(logits, y_used, reduction='mean')
+            grad = torch.autograd.grad(loss, [x_adv])[0]
 
         # TIM: 平滑梯度（translation-invariant）
         if use_tim and tim_k is not None:
@@ -249,6 +276,11 @@ def parse_args():
     parser.set_defaults(use_tim=False)
     parser.add_argument('--tim_kernel', default=7, type=int, help='TIM gaussian kernel size (odd), e.g. 15')
     parser.add_argument('--tim_sigma', default=3.0, type=float, help='TIM gaussian sigma, e.g. 3.0')
+
+    # --- SIM (Scale-Invariant Method) ---
+    parser.add_argument('--use_sim', action='store_true', help='enable SIM (scale-invariant method)')
+    parser.set_defaults(use_sim=False)
+    parser.add_argument('--sim_scales', default=(1.0, 1 / 2, 1 / 4, 1 / 8, 1 / 16), type=float, nargs='+', help='SIM scales')
 
     return parser.parse_args()
 
@@ -308,6 +340,8 @@ def main():
         "use_tim": args.use_tim,
         "tim_kernel": args.tim_kernel,
         "tim_sigma": args.tim_sigma,
+        "use_sim": args.use_sim,
+        "sim_scales": args.sim_scales,
     }
 
     label_csv_path = os.path.join(args.input_dir, 'labels.csv')

@@ -22,6 +22,7 @@ from ppsp.perspective_rotate import _rand_perspective_params, _homography_dlt, _
     _perspective_permutation_transform
 from preprocess import AdvPNGDataset, get_model_output, get_model_prediction
 from ppsp.TIM import build_tim_kernel, tim_grad
+from ppsp.SSA import DI as ssa_DI, gkern as ssa_gkern
 
 
 def parse_args():
@@ -103,6 +104,16 @@ def parse_args():
     # 采样：lambda_w, lambda_h ~ U(-stretch_factor, stretch_factor)
     parser.add_argument('--stretch_factor', default=0.1, type=float, help='max aspect-ratio stretch factor (lambda_w/lambda_h sampled uniformly in [-stretch_factor, stretch_factor])')
 
+    # --- SSA (TI + DI) ---
+    # 仅保留一个总开关 useSSA：开启后同时启用 SSA 的 DI + TI
+    parser.add_argument('--useSSA', dest='useSSA', action='store_true', help='enable SSA (DI + TI)')
+    parser.add_argument('--noSSA', dest='useSSA', action='store_false', help='disable SSA')
+    parser.set_defaults(useSSA=False)
+    parser.add_argument('--ssa_resize_rate', default=1.15, type=float, help='SSA DI resize_rate (>=1.0)')
+    parser.add_argument('--ssa_diversity_prob', default=0.5, type=float, help='SSA DI diversity_prob')
+    parser.add_argument('--ssa_kernel', default=15, type=int, help='SSA TI gaussian kernel size (odd), e.g. 15')
+    parser.add_argument('--ssa_sigma', default=3, type=float, help='SSA TI gaussian sigma, e.g. 3')
+
     return parser.parse_args()
 
 
@@ -140,7 +151,12 @@ def mifgsm_attack_ppsp(x, y, model, eps=16 / 255, iterations=10, mu=1.0,
                       si_scales: tuple[float, ...] = (1.0, 0.5, 0.25, 0.125, 0.0625),
                       use_tim: bool = False,
                       tim_kernel: int = 7,
-                      tim_sigma: float = 3):
+                      tim_sigma: float = 3,
+                      useSSA: bool = False,
+                      ssa_resize_rate: float = 1.15,
+                      ssa_diversity_prob: float = 0.5,
+                      ssa_kernel: int = 7,
+                      ssa_sigma: float = 3):
     """MI-FGSM + (BSR 或 默认分块透视+旋转)。
 
     - bsr=True:  BSR 路径（置换 + 分块透视 + 分块旋转），旋转角度由 max_angle_bsr 控制
@@ -151,6 +167,10 @@ def mifgsm_attack_ppsp(x, y, model, eps=16 / 255, iterations=10, mu=1.0,
     use_si:
       True  => 使用 SI-MI-FGSM 的多尺度梯度估计（对 x_adv 求梯度，内部做 x_adv*scale）
       False => 使用原先单尺度 loss.backward() 的梯度
+
+    useSSA:
+      True  => 同时启用 SSA 的 DI + TI
+      False => 不启用 SSA
     """
     alpha = eps / iterations
     x_adv = x.clone().requires_grad_(True)
@@ -161,11 +181,17 @@ def mifgsm_attack_ppsp(x, y, model, eps=16 / 255, iterations=10, mu=1.0,
     if use_tim:
         tim_k = build_tim_kernel(kernlen=int(tim_kernel), nsig=float(tim_sigma), channels=int(x.size(1))).to(x.device)
 
+    # 仅构建一次 SSA TI kernel
+    ssa_ti_k = None
+    if useSSA:
+        ssa_ti_k = ssa_gkern(kernlen=int(ssa_kernel), nsig=float(ssa_sigma), channels=int(x.size(1)), device=x.device)
+
     for i in range(iterations):
 
-        if use_diversity:
-            # input_diversity 内部每次调用都会采样一次随机 resize/pad，所以直接对整个 x_aug 调用即可
-            # （batch 内每张图共享同一次 rnd/pad 采样是 DI 的常见实现；如果你要 per-image 独立采样，需要改 DIM 实现）
+        # DI：开启 useSSA 时优先用 SSA 的 DI；否则走原来的 DIM（如果开启）
+        if useSSA:
+            x_transformed = ssa_DI(x_adv, resize_rate=float(ssa_resize_rate), diversity_prob=float(ssa_diversity_prob))
+        elif use_diversity:
             x_transformed = input_diversity(x_adv, prob=diversity_prob)
         else:
             x_transformed = x_adv
@@ -266,6 +292,10 @@ def mifgsm_attack_ppsp(x, y, model, eps=16 / 255, iterations=10, mu=1.0,
         if use_tim and tim_k is not None:
             grad = tim_grad(grad, kernel=tim_k)
 
+        # SSA-TI：depthwise conv2d 高斯平滑
+        if useSSA and ssa_ti_k is not None:
+            grad = F.conv2d(grad, ssa_ti_k, stride=1, padding=int(ssa_kernel) // 2, groups=int(x.size(1)))
+
         l1 = torch.mean(torch.abs(grad), dim=(1, 2, 3), keepdim=True) + 1e-8
         grad = grad / l1
 
@@ -358,6 +388,11 @@ def main():
             use_tim=args.use_tim,
             tim_kernel=args.tim_kernel,
             tim_sigma=args.tim_sigma,
+            useSSA=args.useSSA,
+            ssa_resize_rate=args.ssa_resize_rate,
+            ssa_diversity_prob=args.ssa_diversity_prob,
+            ssa_kernel=args.ssa_kernel,
+            ssa_sigma=args.ssa_sigma,
         )
 
         source_adv_preds = get_model_prediction(source_model, x_adv_batch)
