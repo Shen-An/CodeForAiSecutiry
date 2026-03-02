@@ -5,35 +5,32 @@ import torch.nn.functional as F
 import numpy as np
 import random
 from PIL import Image
-from torchvision import transforms
+from torchvision import models, transforms
 from models import ModelRepository
 
 
 # ==========================================
-# 1. 配置 (Config)
+# 1. Configuration
 # ==========================================
-
 class Config:
+    """Configuration for the SID Attack"""
     output_dir = './outputs'
-    trans_dir = './trans'
+    trans_dir = './trans_results'  # 保存 i=5 时的 20 张变换图片
     max_epsilon = 16.0
     momentum = 1.0
-    N = 20  # 谱变换数量
-    K = 2  # 块数量
-    beta = 0.1  # 下采样因子
-    p = 0.5  # 融合概率
-    omega = 0.5  # 线性融合权重
+    N = 20  # 谱变换数量 (生成 20 张)
+    K = 2  # Number of blocks
+    beta = 0.1  # Downsampling factor
+    p = 0.5  # Probability of image block fusion
+    omega = 0.5  # Weight of linear fusion
 
 
 opt = Config()
 
 
 # ==========================================
-# 2. 核心函数 (DCT, Fusion, Multi-scale)
+# 2. 原版 DCT 函数 (SID核心)
 # ==========================================
-# (保留你提供的 dct, idct, dct_2d, idct_2d, get_length, random_flip_batch,
-#  frequency_fusion_batch, linear_fusion_batch, local_fusion_batch, multi_scale_batch 函数)
-
 def dct(x, norm=None):
     x_shape = x.shape
     N = x_shape[-1]
@@ -41,13 +38,13 @@ def dct(x, norm=None):
     v = torch.cat([x[:, ::2], x[:, 1::2].flip([1])], dim=1)
     Vc = torch.fft.fft(v)
     k = - torch.arange(N, dtype=x.dtype, device=x.device)[None, :] * np.pi / (2 * N)
-    W_r = torch.cos(k);
+    W_r = torch.cos(k)
     W_i = torch.sin(k)
     V = Vc.real * W_r - Vc.imag * W_i
     if norm == 'ortho':
         V[:, 0] /= np.sqrt(N) * 2
         V[:, 1:] /= np.sqrt(N / 2) * 2
-    return (2 * V.view(*x_shape))
+    return 2 * V.view(*x_shape)
 
 
 def idct(X, norm=None):
@@ -58,7 +55,7 @@ def idct(X, norm=None):
         X_v[:, 0] *= np.sqrt(N) * 2
         X_v[:, 1:] *= np.sqrt(N / 2) * 2
     k = torch.arange(x_shape[-1], dtype=X.dtype, device=X.device)[None, :] * np.pi / (2 * N)
-    W_r = torch.cos(k);
+    W_r = torch.cos(k)
     W_i = torch.sin(k)
     V_t_r = X_v
     V_t_i = torch.cat([X_v[:, :1] * 0, -X_v.flip([1])[:, :-1]], dim=1)
@@ -85,6 +82,9 @@ def idct_2d(X, norm=None):
     return x2.transpose(-1, -2)
 
 
+# ==========================================
+# 3. 原版频域融合与多尺度逻辑
+# ==========================================
 def get_length(length, num_block):
     length = int(length)
     rand = np.random.uniform(size=num_block, low=0.1, high=0.9)
@@ -103,9 +103,14 @@ def frequency_fusion_batch(patch, x):
     _, _, patch_w, patch_h = patch.shape
     rescale_x = F.interpolate(org_x, size=[patch_w, patch_h], mode='bilinear', align_corners=False)
     rescale_flip_x = random_flip_batch(rescale_x)
+
     dctx = dct_2d(rescale_flip_x)
     dctp = dct_2d(patch)
-    low_w, low_h = int(dctx.shape[2] * 0.4), int(dctx.shape[3] * 0.4)
+
+    _, _, w, h = dctx.shape
+    low_w = int(w * 0.4)
+    low_h = int(h * 0.4)
+
     dctx[:, :, 0:low_w, 0:low_h] = dctp[:, :, 0:low_w, 0:low_h]
     return idct_2d(dctx)
 
@@ -119,17 +124,26 @@ def local_fusion_batch(x, num_block=2, probabilities=0.5, omega=0.5):
     N, C, w, h = x.shape
     width_length = get_length(w, num_block)
     height_length = get_length(h, num_block)
+
     x_split_w = torch.split(x, width_length, dim=2)
     x_split_h_l = [torch.split(sw, height_length, dim=3) for sw in x_split_w]
+
     ret_list = []
     for strip in x_split_h_l:
         temp_list = []
         for patch in strip:
             mask_fuse = (torch.rand(N, 1, 1, 1, device=x.device) >= probabilities)
             mask_freq = (torch.rand(N, 1, 1, 1, device=x.device) < 0.5)
-            fused = torch.where(mask_freq, frequency_fusion_batch(patch, x), linear_fusion_batch(patch, x, omega))
-            temp_list.append(random_flip_batch(torch.where(mask_fuse, fused, patch)))
+
+            freq_out = frequency_fusion_batch(patch, x)
+            linear_out = linear_fusion_batch(patch, x, omega)
+
+            fused = torch.where(mask_freq, freq_out, linear_out)
+            x_enh = torch.where(mask_fuse, fused, patch)
+            temp_list.append(random_flip_batch(x_enh))
+
         ret_list.append(torch.cat(temp_list, dim=3))
+
     return torch.cat(ret_list, dim=2)
 
 
@@ -144,41 +158,54 @@ def multi_scale_batch(x_batch):
         else:
             new_size = int(H * resize_ratio)
             rescaled = F.interpolate(img_slice, size=[new_size, new_size], mode='bilinear', align_corners=False)
-            h_rem, w_rem = H - new_size, W - new_size
-            p_t, p_l = random.randint(0, h_rem), random.randint(0, w_rem)
-            ret = F.pad(rescaled, [p_l, w_rem - p_l, p_t, h_rem - p_t], value=0)
-        if random.random() < 0.5: ret = torch.flip(ret, dims=(3,))
+            h_rem = H - new_size
+            w_rem = W - new_size
+            pad_top = random.randint(0, h_rem)
+            pad_left = random.randint(0, w_rem)
+            ret = F.pad(rescaled, [pad_left, w_rem - pad_left, pad_top, h_rem - pad_top], value=0)
+
+        if random.random() < 0.5:
+            ret = torch.flip(ret, dims=(3,))
         outputs.append(ret)
+
     return torch.cat(outputs, dim=0)
 
 
 # ==========================================
-# 3. 单图攻击逻辑
+# 4. Attack Logic (保存 i=5 时的全部 20 张)
 # ==========================================
-
-def SID_Single(image, gt, model, min_val, max_val, save_name):
+def SID(images, gt, model, min_val, max_val, image_name):
     momentum = opt.momentum
     num_iter = 10
     eps = opt.max_epsilon / 255.0
     alpha = eps / num_iter
-    x = image.clone()
+    x = images.clone()
     grad = torch.zeros_like(x)
 
-    if not os.path.exists(opt.trans_dir): os.makedirs(opt.trans_dir)
+    pure_name = os.path.splitext(image_name)[0]
 
     for i in range(num_iter):
         x.requires_grad = True
+
+        # SID 核心变换
         x_batch = x.repeat(opt.N, 1, 1, 1)
         x_emb = local_fusion_batch(x_batch, opt.K, opt.p, opt.omega)
         x_input = multi_scale_batch(x_emb)
 
-        # 保存变换中间图
-        if i == 5:
-            t_img = (np.clip(x_input[0].detach().cpu().permute(1, 2, 0).numpy(), 0, 1) * 255).astype(np.uint8)
-            Image.fromarray(t_img).save(os.path.join(opt.trans_dir, f"trans_{save_name}"))
+        # 👉 核心需求：在 i=5 时，保存这 20 张带有 SID 噪声/伪影的中间图
+        if i == 0:
+            print(f"--> [Iter 5] 正在提取 {opt.N} 张 SID 变换中间图...")
+            for j in range(opt.N):
+                t_img = x_input[j].detach().cpu().permute(1, 2, 0).numpy()
+                t_img = (np.clip(t_img, 0, 1) * 255).astype(np.uint8)
+                save_path = os.path.join(opt.trans_dir, f"{pure_name}_iter5_trans_{j:02d}.png")
+                Image.fromarray(t_img).save(save_path)
+            print(f"--> 保存完成！路径: {os.path.abspath(opt.trans_dir)}")
 
+        # 前向反向传播求梯度
         output = model(x_input)
-        if isinstance(output, (list, tuple)): output = output[0]
+        if isinstance(output, (list, tuple)):
+            output = output[0]
 
         loss = F.cross_entropy(output, gt.repeat(opt.N))
         model.zero_grad()
@@ -196,46 +223,57 @@ def SID_Single(image, gt, model, min_val, max_val, save_name):
 
 
 # ==========================================
-# 4. 主程序 (指定单张图片)
+# 5. Main Execution (单图执行)
 # ==========================================
-
 def main():
-    # --- 用户修改部分 ---
-    input_image_path = r'E:\TransferAttack\RuiGuoCode\data\images\ILSVRC2012_val_00013393.png'  # 这里改图片路径
-    label_val = 1  # 这里改标签（会自动+1匹配你的逻辑）
-    # ------------------
-
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if not os.path.exists(opt.output_dir): os.makedirs(opt.output_dir)
+    print(f"Running on device: {device}")
 
-    # 模型加载
+    os.makedirs(opt.output_dir, exist_ok=True)
+    os.makedirs(opt.trans_dir, exist_ok=True)
+
+    # Setup Model
     model_repo = ModelRepository(device)
-    model = model_repo.get_one_model('tf2torch_inception_v3')['model']
+    model_info = model_repo.get_source_model('tf2torch_inception_v3')
+    model = model_info['model']
     model.eval()
 
-    transform = transforms.Compose([transforms.Resize((299, 299)), transforms.ToTensor()])
+    transform = transforms.Compose([
+        transforms.Resize((299, 299)),
+        transforms.ToTensor(),
+    ])
 
-    if not os.path.exists(input_image_path):
-        print(f"找不到图片: {input_image_path}")
+    # 👉 指定你的图片路径
+    img_path = r'E:\TransferAttack\RuiGuoCode\data\images\ILSVRC2012_val_00013393.png'
+
+    if not os.path.exists(img_path):
+        print(f"Error: 找不到指定的图片文件 -> {img_path}")
         return
 
-    # 加载单张图片
-    filename = os.path.basename(input_image_path)
-    img = Image.open(input_image_path).convert('RGB')
+    filename = os.path.basename(img_path)
+    label_val = 1  # 默认标签
+
+    print(f"Starting SID attack on single image: {filename} ...")
+
+    # Load Image
+    img = Image.open(img_path).convert('RGB')
     x = transform(img).unsqueeze(0).to(device)
-    y = torch.tensor([label_val + 1], device=device)
+    y = torch.tensor([label_val], device=device)
 
-    # 约束
-    img_min = torch.clamp(x - (opt.max_epsilon / 255.0), 0.0, 1.0)
-    img_max = torch.clamp(x + (opt.max_epsilon / 255.0), 0.0, 1.0)
+    # constraints
+    images_min = torch.clamp(x - (opt.max_epsilon / 255.0), 0.0, 1.0)
+    images_max = torch.clamp(x + (opt.max_epsilon / 255.0), 0.0, 1.0)
 
-    print(f"正在处理图片: {filename} ...")
-    x_adv = SID_Single(x, y, model, img_min, img_max, filename)
+    # Run Attack (内部处理了 i=5 保存逻辑)
+    x_adv = SID(x, y, model, images_min, images_max, filename)
 
-    # 保存结果
-    adv_np = (np.clip(x_adv.squeeze(0).cpu().permute(1, 2, 0).numpy(), 0, 1) * 255).astype(np.uint8)
-    Image.fromarray(adv_np).save(os.path.join(opt.output_dir, filename))
-    print(f"攻击完成，结果已保存至 {opt.output_dir}")
+    # 保存最终生成的对抗样本
+    adv_img = x_adv.squeeze(0).cpu().permute(1, 2, 0).numpy()
+    adv_img = (np.clip(adv_img, 0, 1) * 255).astype(np.uint8)
+    out_path = os.path.join(opt.output_dir, filename)
+    Image.fromarray(adv_img).save(out_path)
+
+    print(f"Attack finished. 最终对抗样本已保存至 {out_path}")
 
 
 if __name__ == "__main__":

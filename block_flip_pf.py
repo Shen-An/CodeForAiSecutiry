@@ -102,7 +102,7 @@ def parse_args():
 
     # 块内拉伸（Aspect-Ratio Stretching）：单参数
     # 采样：lambda_w, lambda_h ~ U(-stretch_factor, stretch_factor)
-    parser.add_argument('--stretch_factor', default=0.1, type=float, help='max aspect-ratio stretch factor (lambda_w/lambda_h sampled uniformly in [-stretch_factor, stretch_factor])')
+    parser.add_argument('--stretch_factor', default=0.0, type=float, help='max aspect-ratio stretch factor (lambda_w/lambda_h sampled uniformly in [-stretch_factor, stretch_factor])')
 
     # --- SSA (TI + DI) ---
     # 仅保留一个总开关 useSSA：开启后同时启用 SSA 的 DI + TI

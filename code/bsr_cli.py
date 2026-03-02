@@ -13,7 +13,7 @@ from models import ModelRepository
 from torch.utils.data import DataLoader,  TensorDataset
 import math
 
-from preprocess import AdvPNGDataset, get_model_output, load_source_model, get_model_prediction
+from preprocess import AdvPNGDataset, get_model_output, get_model_prediction
 
 
 def get_block_lengths_bsr(length, num_blocks):
