@@ -4,7 +4,7 @@
 clear; clc;
 
 % ---- 1) 路径（按你的工程结构）----
-csvPath = fullfile('results', 'loss_perspective_mean.csv');
+csvPath = fullfile('results', 'loss_block_pf_mean.csv');
 outPng  = fullfile('results', 'loss_surface.png');
 outFig  = fullfile('results', 'loss_surface.fig');
 
